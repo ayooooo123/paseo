@@ -3,10 +3,11 @@ import {
   planTimelineResumeFetch,
   type ProjectedTimelineForwardFetchPlan,
 } from "./timeline-sync-plan";
-import type { CachedTimeline } from "@/runtime/replica-cache";
+import type { CachedChatSnapshot, CachedTimeline } from "@/runtime/replica-cache";
 import {
   selectAgentTimelineState,
   useSessionStore,
+  type Agent,
   type AgentTimelineCursorState,
   type AgentTimelineState,
 } from "@/stores/session-store";
@@ -32,7 +33,8 @@ import { replaceWithCanonicalStream } from "@/types/stream";
 const PLUGIN_TIMELINE_REPROJECTION_DELAY_MS = 50;
 
 export interface TimelineReplicaStorage {
-  readTimeline(serverId: string, agentId: string): Promise<CachedTimeline | undefined>;
+  readChatSnapshot?(serverId: string, agentId: string): Promise<CachedChatSnapshot>;
+  readTimeline?(serverId: string, agentId: string): Promise<CachedTimeline | undefined>;
   commitTimeline(serverId: string, agentId: string, timeline: CachedTimeline): void;
 }
 
@@ -40,14 +42,17 @@ async function prepareCachedTimeline(input: {
   serverId: string;
   agentId: string;
   storage: TimelineReplicaStorage;
-  prepareAgent: (agentId: string) => Promise<void>;
+  prepareAgent: (agentId: string, cachedAgent?: Agent) => Promise<void>;
 }): Promise<CachedTimeline | undefined> {
   const before = useSessionStore.getState().sessions[input.serverId];
   const beforeTimeline = selectAgentTimelineState(before, input.agentId);
   if (beforeTimeline.status === "synced") return undefined;
   const beforeHead = before?.agentStreamHead.get(input.agentId);
-  await input.prepareAgent(input.agentId);
-  const stored = await input.storage.readTimeline(input.serverId, input.agentId);
+  const snapshot = input.storage.readChatSnapshot
+    ? await input.storage.readChatSnapshot(input.serverId, input.agentId)
+    : { timeline: await input.storage.readTimeline?.(input.serverId, input.agentId) };
+  await input.prepareAgent(input.agentId, snapshot.agent);
+  const stored = snapshot.timeline;
   if (!stored) return undefined;
   const session = useSessionStore.getState().sessions[input.serverId];
   const currentTimeline = selectAgentTimelineState(session, input.agentId);
@@ -103,7 +108,7 @@ class TimelineReplicaOwner implements TimelineReplica {
   constructor(
     private readonly serverId: string,
     private readonly storage: TimelineReplicaStorage,
-    private readonly prepareAgent: (agentId: string) => Promise<void>,
+    private readonly prepareAgent: (agentId: string, cachedAgent?: Agent) => Promise<void>,
   ) {}
 
   async prepare(agentId: string): Promise<void> {
@@ -155,7 +160,7 @@ class TimelineReplicaOwner implements TimelineReplica {
 export function createTimelineReplica(input: {
   serverId: string;
   storage: TimelineReplicaStorage;
-  prepareAgent: (agentId: string) => Promise<void>;
+  prepareAgent: (agentId: string, cachedAgent?: Agent) => Promise<void>;
 }): TimelineReplica {
   return new TimelineReplicaOwner(input.serverId, input.storage, input.prepareAgent);
 }
@@ -163,6 +168,11 @@ export function createTimelineReplica(input: {
 export interface TimelinePageResult {
   hasNewer: boolean;
   endCursor: { epoch: string; seq: number } | null;
+}
+
+interface TimelineSubscriptionBootstrapResult {
+  agentId: string;
+  page: TimelinePageResult;
 }
 
 export type TimelineResponsePayload = Extract<
@@ -300,7 +310,10 @@ export interface ViewedTimelineSyncPorts {
   initialDeliveryMode: TimelineDeliveryMode;
   prepare(agentId: string): Promise<void>;
   replaceDemandedAgentIds(agentIds: string[]): void;
-  setSubscription(agentIds: string[]): Promise<void>;
+  setSubscription(
+    agentIds: string[],
+    bootstrap?: { agentId: string; request: ProjectedTimelineForwardFetchPlan },
+  ): Promise<TimelineSubscriptionBootstrapResult | undefined | void>;
   readCursor(agentId: string): { epoch: string; endSeq: number } | undefined;
   fetchPage(
     agentId: string,
@@ -628,8 +641,10 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     }
   };
 
-  const ensureCacheLoaded = (agentId: string): void => {
-    if (loadedCache.has(agentId) || cacheLoads.has(agentId)) return;
+  const ensureCacheLoaded = (agentId: string): Promise<void> => {
+    if (loadedCache.has(agentId)) return Promise.resolve();
+    const existing = cacheLoads.get(agentId);
+    if (existing) return existing;
     const load = ports
       .prepare(agentId)
       .catch((error) => ports.reportError(error))
@@ -640,6 +655,7 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
         startCatchUp(agentId, { request: pending, supersede: Boolean(pending) });
       });
     cacheLoads.set(agentId, load);
+    return load;
   };
 
   const startCatchUp = (
@@ -699,14 +715,49 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     }
   };
 
+  const acceptSubscriptionBootstrap = (bootstrap: TimelineSubscriptionBootstrapResult): void => {
+    const catchUpGeneration = (catchUpGenerations.get(bootstrap.agentId) ?? 0) + 1;
+    catchUpGenerations.set(bootstrap.agentId, catchUpGeneration);
+    if (bootstrap.page.hasNewer) {
+      if (!bootstrap.page.endCursor) {
+        throw new Error(`Timeline page for ${bootstrap.agentId} hasNewer without an end cursor`);
+      }
+      pendingCatchUps.set(bootstrap.agentId, planTimelineCatchUpAfter(bootstrap.page.endCursor));
+      return;
+    }
+    catchUps.set(bootstrap.agentId, { generation: catchUpGeneration, status: "complete" });
+    setVisibilityCatchUpReady(bootstrap.agentId);
+  };
+
+  const isSelectiveMembershipActive = (): boolean =>
+    !disposed && connected && deliveryMode === "selective";
+
+  const ownsMembershipRequest = (generation: number, requested: string[]): boolean =>
+    isSelectiveMembershipActive() &&
+    generation === membershipGeneration &&
+    sameAgentIds(desired, requested);
+
   const reconcileLatestMembership = async (): Promise<void> => {
-    if (disposed || !connected || deliveryMode !== "selective") return;
+    if (!isSelectiveMembershipActive()) return;
     const generation = membershipGeneration;
     const requested = desired;
     if (!membershipNeedsRetry && sameAgentIds(requested, acknowledged)) return;
     membershipNeedsRetry = false;
     try {
-      await ports.setSubscription(requested);
+      const bootstrapAgentId = visibleAgentIds().find((agentId) => requested.includes(agentId));
+      if (bootstrapAgentId) await ensureCacheLoaded(bootstrapAgentId);
+      const bootstrapRequest = bootstrapAgentId
+        ? planTimelineResumeFetch(ports.readCursor(bootstrapAgentId))
+        : undefined;
+      const bootstrap = await ports.setSubscription(
+        requested,
+        bootstrapAgentId && bootstrapRequest
+          ? { agentId: bootstrapAgentId, request: bootstrapRequest }
+          : undefined,
+      );
+      if (bootstrap && ownsMembershipRequest(generation, requested)) {
+        acceptSubscriptionBootstrap(bootstrap);
+      }
     } catch (error) {
       membershipNeedsRetry = true;
       setVisibilityCatchUpError(requested, error);
@@ -714,14 +765,7 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
       const nextRetryDelayMs = getNextRetryDelayMs(membershipRetryDelayMs);
       cancelMembershipRetry = ports.schedule(() => {
         cancelMembershipRetry = null;
-        if (
-          disposed ||
-          !connected ||
-          membershipGeneration !== generation ||
-          !sameAgentIds(desired, requested)
-        ) {
-          return;
-        }
+        if (!ownsMembershipRequest(generation, requested)) return;
         void reconcileMembership();
       }, nextRetryDelayMs);
       membershipRetryDelayMs = nextRetryDelayMs;
@@ -731,7 +775,7 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     cancelMembershipRetry?.();
     cancelMembershipRetry = null;
     membershipRetryDelayMs = undefined;
-    if (disposed || !connected || deliveryMode !== "selective") return;
+    if (!isSelectiveMembershipActive()) return;
     acknowledged = requested;
     if (generation !== membershipGeneration) {
       await reconcileLatestMembership();

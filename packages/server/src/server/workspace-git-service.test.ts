@@ -9,6 +9,7 @@ import type {
   PullRequestStatusResult,
 } from "../utils/checkout-git.js";
 import {
+  WORKSPACE_GIT_FETCH_CONCURRENCY,
   WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
   WORKSPACE_GIT_REFRESH_CONCURRENCY,
   WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS,
@@ -914,6 +915,71 @@ describe("WorkspaceGitServiceImpl", () => {
 
     first.unsubscribe();
     second.unsubscribe();
+    service.dispose();
+  });
+
+  test("background git fetches are bounded by WORKSPACE_GIT_FETCH_CONCURRENCY", async () => {
+    const fetchDeferreds = [
+      createDeferred<void>(),
+      createDeferred<void>(),
+      createDeferred<void>(),
+      createDeferred<void>(),
+    ];
+    let activeFetches = 0;
+    let peakActiveFetches = 0;
+    const runGitFetch = vi.fn(async (cwd: string) => {
+      activeFetches += 1;
+      peakActiveFetches = Math.max(peakActiveFetches, activeFetches);
+      const index = Number(cwd.replace(/.*repo-/, ""));
+      await fetchDeferreds[index]?.promise;
+      activeFetches -= 1;
+      return { changes: [], error: null };
+    });
+    const hasOriginRemote = vi.fn(async () => true);
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => ({
+      ...createCheckoutSnapshotFacts(cwd),
+      gitCommonDir: join(cwd, ".git"),
+      absoluteGitDir: join(cwd, ".git"),
+    }));
+    const resolveAbsoluteGitDir = vi.fn(async (cwd: string) => join(cwd, ".git"));
+
+    const service = createService({
+      getCheckoutSnapshotFacts,
+      resolveAbsoluteGitDir,
+      hasOriginRemote,
+      runGitFetch,
+    });
+
+    const repos = [
+      path.resolve("/tmp/repo-0"),
+      path.resolve("/tmp/repo-1"),
+      path.resolve("/tmp/repo-2"),
+      path.resolve("/tmp/repo-3"),
+    ];
+
+    const subscriptions = repos.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+
+    await vi.waitFor(() => {
+      expect(runGitFetch).toHaveBeenCalledTimes(WORKSPACE_GIT_FETCH_CONCURRENCY);
+      expect(activeFetches).toBe(WORKSPACE_GIT_FETCH_CONCURRENCY);
+      expect(peakActiveFetches).toBe(WORKSPACE_GIT_FETCH_CONCURRENCY);
+    });
+
+    fetchDeferreds[0].resolve();
+    fetchDeferreds[1].resolve();
+    await flushPromises();
+
+    await vi.waitFor(() => {
+      expect(runGitFetch).toHaveBeenCalledTimes(4);
+    });
+
+    fetchDeferreds[2].resolve();
+    fetchDeferreds[3].resolve();
+    await flushPromises();
+
+    expect(peakActiveFetches).toBe(WORKSPACE_GIT_FETCH_CONCURRENCY);
+
+    subscriptions.forEach((sub) => sub.unsubscribe());
     service.dispose();
   });
 

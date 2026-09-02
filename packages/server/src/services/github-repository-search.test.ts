@@ -75,20 +75,35 @@ describe("GitHub repository search", () => {
     ]);
   });
 
-  it("searches accessible repositories for a typed query", async () => {
+  it("finds a repository you own that GitHub's search index would miss", async () => {
+    // The regression this guards: `gh search repos` omits forks and cannot see
+    // private repositories, so a query used to return other people's projects
+    // while hiding the user's own. Own repositories are filtered locally now.
     const runner = createRunner([
       JSON.stringify([
         {
           id: 42,
           name: "private-repo",
-          fullName: "octo/private-repo",
+          nameWithOwner: "octo/private-repo",
           description: "Private project",
           isPrivate: true,
           updatedAt: "2026-07-14T08:00:00Z",
+          sshUrl: "git@github.com:octo/private-repo.git",
           url: "https://github.com/octo/private-repo",
+        },
+        {
+          id: 43,
+          name: "unrelated",
+          nameWithOwner: "octo/unrelated",
+          description: null,
+          isPrivate: false,
+          updatedAt: "2026-07-13T08:00:00Z",
+          sshUrl: "git@github.com:octo/unrelated.git",
+          url: "https://github.com/octo/unrelated",
         },
       ]),
       "https",
+      "[]",
     ]);
     const service = createGitHubService({
       runner: runner.runner,
@@ -96,7 +111,7 @@ describe("GitHub repository search", () => {
     });
 
     await expect(
-      service.searchRepositories({ cwd: "/tmp", query: " private project ", limit: 5 }),
+      service.searchRepositories({ cwd: "/tmp", query: " private ", limit: 5 }),
     ).resolves.toEqual([
       {
         id: "42",
@@ -108,27 +123,35 @@ describe("GitHub repository search", () => {
         cloneUrl: "https://github.com/octo/private-repo",
       },
     ]);
-    expect(runner.calls).toEqual([
-      {
-        args: [
-          "search",
-          "repos",
-          "private project",
-          "--json",
-          "id,name,fullName,description,isPrivate,updatedAt,url",
-          "--sort",
-          "updated",
-          "--order",
-          "desc",
-          "--limit",
-          "5",
-        ],
-        options: { cwd: "/tmp" },
-      },
-      {
-        args: ["config", "get", "git_protocol", "--host", "github.com"],
-        options: { cwd: "/tmp" },
-      },
+    expect(runner.calls[0]?.args.slice(0, 2)).toEqual(["repo", "list"]);
+    // Own matches did not fill the limit, so the rest of GitHub is consulted
+    // afterwards — never instead.
+    expect(runner.calls.at(-1)?.args.slice(0, 3)).toEqual(["search", "repos", "private"]);
+  });
+
+  it("does not consult global search when owned repositories fill the limit", async () => {
+    const runner = createRunner([
+      JSON.stringify([
+        {
+          id: 1,
+          name: "alpha",
+          nameWithOwner: "octo/alpha",
+          description: null,
+          isPrivate: false,
+          updatedAt: "2026-07-14T08:00:00Z",
+          sshUrl: "git@github.com:octo/alpha.git",
+          url: "https://github.com/octo/alpha",
+        },
+      ]),
+      "https",
     ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+    });
+
+    const results = await service.searchRepositories({ cwd: "/tmp", query: "alpha", limit: 1 });
+    expect(results.map((repository) => repository.nameWithOwner)).toEqual(["octo/alpha"]);
+    expect(runner.calls.some((call) => call.args[0] === "search")).toBe(false);
   });
 });

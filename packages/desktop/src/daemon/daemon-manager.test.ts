@@ -454,6 +454,7 @@ describe("daemon-manager commands", () => {
         stdio: ["ignore", "ignore", "ignore"],
         envOverlay: expect.objectContaining({
           PASEO_CLI: getBundledCliShimPath(),
+          PASEO_DHT_ENABLED: "true",
           PASEO_WEB_UI_ENABLED: "false",
         }),
       }),

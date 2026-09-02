@@ -30,6 +30,9 @@ interface TestPaseoDaemonOptions {
   relayPublicUseTls?: boolean;
   daemonStatusRpcCapability?: boolean;
   relayConfigCapability?: boolean;
+  dhtEnabled?: boolean;
+  dhtBootstrap?: readonly string[];
+  dhtBlockingListen?: boolean;
   agentClients?: Partial<Record<AgentProvider, AgentClient>>;
   providerOverrides?: PaseoDaemonConfig["providerOverrides"];
   paseoHomeRoot?: string;
@@ -186,6 +189,9 @@ async function prepareTestDaemonConfig(
     relayEndpoint: options.relayEndpoint ?? "relay.paseo.sh:443",
     relayUseTls: options.relayUseTls,
     relayPublicUseTls: options.relayPublicUseTls,
+    dhtEnabled: options.dhtEnabled ?? false,
+    dhtBootstrap: options.dhtBootstrap,
+    dhtBlockingListen: options.dhtBlockingListen,
     appBaseUrl: "https://app.paseo.sh",
     auth: options.auth,
     pushNotificationSender: options.pushNotificationSender,

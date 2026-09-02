@@ -403,6 +403,7 @@ async function startDaemon(): Promise<DesktopDaemonStatus> {
     envOverlay: {
       PASEO_DESKTOP_MANAGED: "1",
       PASEO_CLI: getBundledCliShimPath(),
+      PASEO_DHT_ENABLED: "true",
       PASEO_WEB_UI_ENABLED: "false",
     },
     stdio: ["ignore", "ignore", "ignore"],

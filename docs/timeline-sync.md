@@ -98,11 +98,12 @@ path or issuing a separate persistence notification.
 Removing the host from the registry is the destructive boundary: it stops the runtime and clears the
 session and host-scoped setup state together.
 
-The timeline owner asks durable replica storage for an agent when that agent becomes visible. An
-accepted row paints immediately before subscription acknowledgement or timeline fetch. The stored
-range describes those exact items: `startSeq` drives older pagination and `endSeq` drives forward
-catch-up. The owner requests `after endSeq`, and requests `before startSeq` when the user loads older
-history. Code outside the owner does not distinguish cached and network timelines.
+The timeline owner asks durable replica storage for the agent and timeline in one focused-chat
+snapshot when that agent becomes visible. An accepted snapshot paints immediately before
+subscription acknowledgement or timeline fetch. The stored range describes those exact items:
+`startSeq` drives older pagination and `endSeq` drives forward catch-up. The owner requests `after
+endSeq`, and requests `before startSeq` when the user loads older history. Code outside the owner
+does not distinguish cached and network timelines.
 
 The first resume request is bounded. If it reports more newer history, fetch one latest bounded tail
 instead of replaying every missed page. Live gap recovery still pages forward until current.
@@ -136,6 +137,9 @@ The app chooses one delivery policy from `server_info.features.selectiveAgentTim
   hot agents; reconnect restores the currently visible set before authoritative catch-up. Revisiting
   an evicted retained timeline displays its cached state immediately while authoritative catch-up
   advances it to the current tail.
+  When the daemon advertises `timelineSubscribeAndFetch`, the subscription replacement and focused
+  agent catch-up run in one RPC. The daemon installs the subscription before taking the timeline
+  snapshot, so live rows cannot fall between separate membership and fetch round trips.
 - Legacy daemons keep globally streaming agent timelines. Visibility still triggers the existing
   authoritative catch-up, but the app does not issue selective-subscription RPCs.
 

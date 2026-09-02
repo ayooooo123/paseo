@@ -20,8 +20,17 @@ function deferred<T>(): Deferred<T> {
 
 interface MembershipRequest {
   agentIds: string[];
-  succeed(): void;
+  bootstrap?: { agentId: string; request: ProjectedTimelineForwardFetchPlan };
+  succeed(result?: MembershipBootstrapResult): void;
   fail(message: string): void;
+}
+
+interface MembershipBootstrapResult {
+  agentId: string;
+  page: {
+    hasNewer: boolean;
+    endCursor: { epoch: string; seq: number } | null;
+  };
 }
 
 interface TimelineFetch {
@@ -44,11 +53,12 @@ class TimelineWorld {
       await this.cacheGate?.promise;
     },
     initialDeliveryMode: "selective",
-    setSubscription: async (agentIds) => {
-      const result = deferred<void>();
+    setSubscription: async (agentIds, bootstrap) => {
+      const result = deferred<MembershipBootstrapResult | undefined>();
       this.memberships.push({
         agentIds,
-        succeed: () => result.resolve(),
+        bootstrap,
+        succeed: (response) => result.resolve(response),
         fail: (message) => result.reject(new Error(message)),
       });
       this.releaseMembershipWaiter();
@@ -221,15 +231,16 @@ test("loads the cache before choosing the authoritative network request", async 
   world.cacheGate = deferred<void>();
   world.sync.setConnected(true);
   world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
-  const membership = await world.nextMembership();
-  membership.succeed();
   const cacheRequest = await world.nextCacheRequest();
 
   expect(cacheRequest).toBe("agent-a");
+  world.expectNoPendingMembership();
   expect(world.pendingFetchCount).toBe(0);
 
   world.cursors.set("agent-a", { epoch: "cached-epoch", endSeq: 17 });
   world.cacheGate.resolve();
+  const membership = await world.nextMembership();
+  membership.succeed();
   const fetch = await world.nextFetch("agent-a");
 
   expect(fetch.request).toEqual({
@@ -239,6 +250,92 @@ test("loads the cache before choosing the authoritative network request", async 
     projection: "projected",
   });
   fetch.respond({ hasNewer: false });
+});
+
+test("accepts a current subscription bootstrap without issuing a duplicate fetch", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+
+  expect(membership.bootstrap).toEqual({
+    agentId: "agent-a",
+    request: { direction: "tail", limit: 40, projection: "projected" },
+  });
+  membership.succeed({
+    agentId: "agent-a",
+    page: { hasNewer: false, endCursor: { epoch: "epoch-agent-a", seq: 4 } },
+  });
+
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+  world.expectNoPendingFetch();
+});
+
+test("continues after a subscription bootstrap that reports newer history", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const membership = await world.nextMembership();
+  membership.succeed({
+    agentId: "agent-a",
+    page: { hasNewer: true, endCursor: { epoch: "epoch-agent-a", seq: 7 } },
+  });
+
+  const catchUp = await world.nextFetch("agent-a");
+  expect(catchUp.request).toEqual({
+    direction: "after",
+    cursor: { epoch: "epoch-agent-a", seq: 7 },
+    limit: 40,
+    projection: "projected",
+  });
+  catchUp.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+});
+
+test("ignores a stale subscription bootstrap after visible membership changes", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const staleMembership = await world.nextMembership();
+
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-b"]);
+  staleMembership.succeed({
+    agentId: "agent-a",
+    page: { hasNewer: false, endCursor: { epoch: "epoch-agent-a", seq: 3 } },
+  });
+
+  const currentMembership = await world.nextMembership();
+  currentMembership.succeed({
+    agentId: "agent-b",
+    page: { hasNewer: false, endCursor: { epoch: "epoch-agent-b", seq: 5 } },
+  });
+  const agentACatchUp = await world.nextFetch("agent-a");
+  agentACatchUp.respond({ hasNewer: false });
+
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-b")).toBe("ready"));
+  expect(currentMembership.agentIds).toEqual(["agent-a", "agent-b"]);
+  world.expectNoPendingFetch();
+});
+
+test("retries a failed combined subscription bootstrap", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  const failed = await world.nextMembership();
+  expect(failed.bootstrap?.agentId).toBe("agent-a");
+  failed.fail("bootstrap unavailable");
+  const retryMembership = await world.nextRetry();
+
+  retryMembership();
+  const retry = await world.nextMembership();
+  retry.succeed({
+    agentId: "agent-a",
+    page: { hasNewer: false, endCursor: { epoch: "epoch-agent-a", seq: 8 } },
+  });
+
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+  expect(world.errors).toEqual(["bootstrap unavailable"]);
+  world.expectNoPendingFetch();
 });
 
 test("catches up after the restored cursor when an agent becomes visible", async () => {

@@ -128,7 +128,10 @@ export default function PairScanScreen() {
     source?: string;
   }>();
   const source = typeof params.source === "string" ? params.source : "settings";
-  const { upsertConnectionFromOfferUrl: upsertDaemonFromOfferUrl } = useHostMutations();
+  const {
+    upsertConnectionFromOfferUrl: upsertDaemonFromOfferUrl,
+    upsertHyperdhtConnectionFromInvite,
+  } = useHostMutations();
 
   const [permission, requestPermission] = useCameraPermissions();
   const [isPairing, setIsPairing] = useState(false);
@@ -162,6 +165,23 @@ export default function PairScanScreen() {
   const handleScan = useCallback(
     async (result: BarcodeScanningResult) => {
       if (isPairing) return;
+      const rawValue = typeof result.data === "string" ? result.data.trim() : "";
+      if (rawValue.startsWith("paseo-peer://v1/")) {
+        if (lastScannedRef.current === rawValue) return;
+        lastScannedRef.current = rawValue;
+        try {
+          setIsPairing(true);
+          const { profile } = await upsertHyperdhtConnectionFromInvite(rawValue);
+          navigateToPairedHost(profile.serverId);
+        } catch (error) {
+          lastScannedRef.current = null;
+          const message = error instanceof Error ? error.message : t("pairing.scan.unableToPair");
+          Alert.alert(t("pairing.scan.errorTitle"), message);
+        } finally {
+          setIsPairing(false);
+        }
+        return;
+      }
       const offerUrl = extractOfferUrlFromScan(result);
       if (!offerUrl) return;
 
@@ -198,7 +218,13 @@ export default function PairScanScreen() {
         setIsPairing(false);
       }
     },
-    [isPairing, navigateToPairedHost, t, upsertDaemonFromOfferUrl],
+    [
+      isPairing,
+      navigateToPairedHost,
+      t,
+      upsertDaemonFromOfferUrl,
+      upsertHyperdhtConnectionFromInvite,
+    ],
   );
 
   const handleRouterBack = useCallback(() => router.back(), [router]);

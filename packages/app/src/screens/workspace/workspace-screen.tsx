@@ -1913,7 +1913,7 @@ function WorkspaceScreenContent({
     routeFocused: isRouteFocused,
     focusedPaneOnly: syncFocusedPaneOnly,
   });
-  useEffect(() => {
+  useLayoutEffect(() => {
     for (const agentId of visibleAgentIds) {
       void getHostRuntimeStore()
         .prepareAgentTimeline(normalizedServerId, agentId)

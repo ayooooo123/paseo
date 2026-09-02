@@ -143,6 +143,35 @@ describe("normalizeStoredHostProfile", () => {
     expect(profile?.appearance).toEqual({ color: "teal", badgeDisplay: "icon" });
   });
 
+  // HostRuntime.persistHosts writes the in-memory HostProfile verbatim, so what
+  // comes back is the runtime connection — fingerprint and all. The stored
+  // variants are strictObject, so a field the runtime adds and the schema omits
+  // fails the whole profile and the paired host silently disappears on relaunch.
+  it("reloads a HyperDHT host that was persisted in its runtime shape", () => {
+    // Canonical base64url of exactly 32 bytes: 43 "A"s is 32 zero bytes with
+    // zero trailing bits, which round-trips through the codec.
+    const invite = `paseo-peer://v1/${"A".repeat(43)}`;
+    const profile = normalizeStoredHostProfile({
+      serverId: "srv_dht",
+      connections: [
+        {
+          id: "hyperdht:AAAAAAAAAAAA",
+          type: "hyperdht",
+          invite,
+          publicKeyFingerprint: "AAAAAAAAAAAA",
+        },
+      ],
+    });
+
+    expect(profile).not.toBeNull();
+    expect(profile?.connections[0]).toEqual({
+      id: "hyperdht:AAAAAAAAAAAA",
+      type: "hyperdht",
+      invite,
+      publicKeyFingerprint: "AAAAAAAAAAAA",
+    });
+  });
+
   it("normalizes stored Remote SSH connection parameters", () => {
     const profile = normalizeStoredHostProfile({
       serverId: "srv_ssh",

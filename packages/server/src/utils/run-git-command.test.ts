@@ -276,6 +276,106 @@ describe("runGitCommand", () => {
     });
   });
 
+  it("lets a chatty process outlive the stall deadline and kills a silent one", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runGitCommand } = await loadRunGitCommand(1);
+
+      // Runs far longer than `idleTimeout` but never goes quiet for that long.
+      // A clone of a large repository looks exactly like this.
+      enqueueSpawnBehaviors({ delayMs: 600 });
+      const chatty = runGitCommand(["clone", "--progress", "https://example.test/repo"], {
+        cwd: process.cwd(),
+        idleTimeout: 120,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const child = fakeSpawnController.processes[0];
+      if (!child) throw new Error("fake git process was not spawned");
+      // Progress git writes past the retained stderr budget must still count as life.
+      child.stderr.emit("data", Buffer.alloc(4096, 0x2e));
+      for (let elapsed = 0; elapsed < 600; elapsed += 100) {
+        await vi.advanceTimersByTimeAsync(100);
+        child.stderr.emit("data", "Receiving objects:  42%\r");
+      }
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(chatty).resolves.toMatchObject({ exitCode: 0 });
+      expect(child.killSignals).toEqual([]);
+
+      enqueueSpawnBehaviors({ delayMs: 5_000 });
+      const silent = runGitCommand(["clone", "--progress", "https://example.test/repo"], {
+        cwd: process.cwd(),
+        idleTimeout: 100,
+      });
+      const rejection = expect(silent).rejects.toThrow(
+        "Git command produced no output for 100ms: git clone --progress https://example.test/repo",
+      );
+      await vi.advanceTimersByTimeAsync(150);
+      await rejection;
+      expect(fakeSpawnController.processes[1]?.killSignals).toEqual(["SIGKILL"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps streaming stderr to onOutput after the retained stderr budget is full", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runGitCommand } = await loadRunGitCommand(1);
+
+      enqueueSpawnBehaviors({ delayMs: 200 });
+      const observed: string[] = [];
+      const command = runGitCommand(["clone", "--progress", "https://example.test/repo"], {
+        cwd: process.cwd(),
+        onOutput: (text) => observed.push(text),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const child = fakeSpawnController.processes[0];
+      if (!child) throw new Error("fake git process was not spawned");
+      // Overflows the 2048-byte retained stderr budget on its own.
+      child.stderr.emit("data", Buffer.alloc(2560, 0x2e));
+      child.stderr.emit("data", "Receiving objects:  42% (123/292)\r");
+      await vi.advanceTimersByTimeAsync(200);
+
+      await expect(command).resolves.toMatchObject({ exitCode: 0 });
+      expect(observed).toHaveLength(2);
+      expect(observed[1]).toBe("Receiving objects:  42% (123/292)\r");
+      // The retained stderr stopped at the budget; the seam did not.
+      expect((await command).stderr.length).toBe(2048);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("swallows an onOutput callback that throws", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runGitCommand } = await loadRunGitCommand(1);
+
+      enqueueSpawnBehaviors({ delayMs: 100 });
+      let calls = 0;
+      const command = runGitCommand(["clone", "--progress", "https://example.test/repo"], {
+        cwd: process.cwd(),
+        onOutput: () => {
+          calls += 1;
+          throw new Error("progress consumer exploded");
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const child = fakeSpawnController.processes[0];
+      if (!child) throw new Error("fake git process was not spawned");
+      // A leaking throw would surface right here, out of the emit call.
+      child.stderr.emit("data", "Receiving objects:  10% (30/292)\r");
+      child.stderr.emit("data", "Receiving objects:  20% (60/292)\r");
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(command).resolves.toMatchObject({ exitCode: 0 });
+      expect(calls).toBe(2);
+      expect(child.killSignals).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("holds the limiter slot until a timed out process exits without waiting for close", async () => {
     const { runGitCommand } = await loadRunGitCommand(1);
 

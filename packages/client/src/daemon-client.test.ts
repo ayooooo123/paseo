@@ -57,7 +57,17 @@ function createTraceRecorder(): { trace: DaemonClientTrace; records: TraceRecord
   };
 }
 
-function createMockTransport() {
+interface MockTransport {
+  transport: DaemonTransport;
+  sent: Array<string | Uint8Array | ArrayBuffer>;
+  triggerOpen: (options?: { preserveSent?: boolean; features?: Record<string, boolean> }) => void;
+  triggerSocketOpen: () => void;
+  triggerClose: (event?: unknown) => void;
+  triggerError: (event?: unknown) => void;
+  triggerMessage: (data: unknown) => void;
+}
+
+function createMockTransport(): MockTransport {
   const sent: Array<string | Uint8Array | ArrayBuffer> = [];
 
   let onMessage: (data: unknown) => void = () => {};
@@ -121,6 +131,9 @@ function createMockTransport() {
         }),
       );
     },
+    // Opens the socket without ever answering hello, the shape of a peer dial
+    // that connects and then goes quiet.
+    triggerSocketOpen: () => onOpen(),
     triggerClose: (event?: unknown) => onClose(event),
     triggerError: (event?: unknown) => onError(event),
     triggerMessage: (data: unknown) => onMessage(data),
@@ -156,10 +169,7 @@ function parseSentFrame(
     .parse(JSON.parse(assertStr(data))).message;
 }
 
-function respondToScheduleRequest(
-  mock: ReturnType<typeof createMockTransport>,
-  request: Record<string, unknown>,
-): void {
+function respondToScheduleRequest(mock: MockTransport, request: Record<string, unknown>): void {
   const responseType =
     request.type === "schedule/create" ? "schedule/create/response" : "schedule/update/response";
 
@@ -363,6 +373,62 @@ test("sets the complete viewed timeline subscription only when the daemon suppor
       agentIds: ["agent-a", "agent-b"],
     },
     legacyFrames: [],
+  });
+});
+
+test("subscribes and fetches the focused timeline in one request", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "timeline_bootstrap",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { timelineSubscribeAndFetch: true } });
+  await connecting;
+
+  const pending = client.subscribeAndFetchAgentTimeline(["agent-b", "agent-a"], "agent-a", {
+    direction: "after",
+    cursor: { epoch: "epoch-1", seq: 4 },
+  });
+  await Promise.resolve();
+  const request = parseSentFrame(mock.sent[0]);
+  const timeline = {
+    requestId: request.requestId,
+    agentId: "agent-a",
+    agent: null,
+    direction: "after" as const,
+    projection: "projected" as const,
+    epoch: "epoch-1",
+    reset: false,
+    staleCursor: false,
+    gap: false,
+    window: { minSeq: 1, maxSeq: 4, nextSeq: 5 },
+    startCursor: null,
+    endCursor: null,
+    hasOlder: true,
+    hasNewer: false,
+    entries: [],
+    error: null,
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.timeline.subscribe_and_fetch.response",
+      payload: { requestId: request.requestId, agentIds: ["agent-a", "agent-b"], timeline },
+    }),
+  );
+
+  await expect(pending).resolves.toEqual(timeline);
+  expect(request).toMatchObject({
+    type: "agent.timeline.subscribe_and_fetch.request",
+    agentIds: ["agent-a", "agent-b"],
+    fetch: {
+      agentId: "agent-a",
+      direction: "after",
+      cursor: { epoch: "epoch-1", seq: 4 },
+    },
   });
 });
 
@@ -1018,6 +1084,91 @@ test("bounds the wait for push token revocation", async () => {
   await vi.advanceTimersByTimeAsync(1);
   await rejection;
   expect(client.getConnectionState().status).toBe("connected");
+});
+
+test("a backoff timer armed before a connection succeeds does not disconnect it", async () => {
+  useHeartbeatClock();
+  // Measured on a Pixel 9 Pro: the app reconnected, sent hello, and the daemon
+  // logged the socket closing ~50ms later, followed by a fresh connection one
+  // base delay behind. The killer is the timer armed by the *previous* drop:
+  // it survives a connection established by any other path, and firing it runs
+  // attemptConnect(), which disposes the transport it is standing on.
+  const closed: number[] = [];
+  const mocks: MockTransport[] = [];
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_stale_reconnect_timer",
+    reconnect: { enabled: true, baseDelayMs: 1_500 },
+    transportFactory: () => {
+      const mock = createMockTransport();
+      const index = mocks.length;
+      mock.transport.close = () => closed.push(index);
+      mocks.push(mock);
+      return mock.transport;
+    },
+  });
+  clients.push(client);
+
+  const firstConnect = client.connect();
+  mocks[0]?.triggerOpen();
+  await firstConnect;
+  expect(client.getConnectionState().status).toBe("connected");
+
+  // The drop arms a backoff timer.
+  mocks[0]?.triggerClose();
+  expect(client.getConnectionState().status).toBe("disconnected");
+
+  // A dial that is not the timer's own gets there first and succeeds.
+  const secondConnect = client.connect();
+  mocks[1]?.triggerOpen();
+  await secondConnect;
+  expect(client.getConnectionState().status).toBe("connected");
+
+  // Well past the armed delay, the live connection is untouched.
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(client.getConnectionState().status).toBe("connected");
+  expect(closed).not.toContain(1);
+  expect(mocks).toHaveLength(2);
+});
+
+test("a generic transport error followed by an open still redials", async () => {
+  useHeartbeatClock();
+  // Measured on a Pixel 9 Pro: one peer dial, then nothing for four minutes.
+  // A generic onerror carries no verdict, so the decision is deferred by 250ms
+  // and an open inside that window cancels it. Dropping the connect deadline as
+  // well leaves 'connecting' with no deadline, no deferral and no backoff timer,
+  // and both retryNow() and ensureConnected() decline to touch a client that is
+  // already 'connecting'. Nothing dials again, ever.
+  const mocks: MockTransport[] = [];
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_hung_dial_retry",
+    reconnect: { enabled: true, baseDelayMs: 1_500 },
+    connectTimeoutMs: 20_000,
+    transportFactory: () => {
+      const mock = createMockTransport();
+      mocks.push(mock);
+      return mock.transport;
+    },
+  });
+  clients.push(client);
+
+  void client.connect().catch(() => {});
+  expect(mocks).toHaveLength(1);
+  mocks[0]?.triggerError({});
+  mocks[0]?.triggerSocketOpen();
+
+  // Foregrounding the app cannot rescue a client stuck in 'connecting'.
+  client.retryNow();
+  client.ensureConnected();
+  expect(mocks).toHaveLength(1);
+
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(client.getConnectionState().status).toBe("disconnected");
+
+  await vi.advanceTimersByTimeAsync(1_500);
+  expect(mocks).toHaveLength(2);
+  expect(client.getConnectionState().status).toBe("connecting");
 });
 
 test("defaults session RPC waiters to sixty seconds", async () => {
@@ -6060,6 +6211,120 @@ test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", 
       error: null,
       lastMessage: null,
     });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("cloneGithubProject deadline is refreshed by clone progress and only fires when idle", async () => {
+  useHeartbeatClock();
+  try {
+    const logger = createMockLogger();
+    const mock = createMockTransport();
+
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_unit_test",
+      logger,
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+
+    const connectPromise = client.connect();
+    mock.triggerOpen();
+    await connectPromise;
+
+    const clonePromise = client.cloneGithubProject(
+      { repo: "owner/repo", targetDirectory: "~/workspace" },
+      "req-clone-idle",
+    );
+
+    let settled: "pending" | "resolved" | "rejected" = "pending";
+    void clonePromise.then(
+      () => {
+        settled = "resolved";
+        return null;
+      },
+      () => {
+        settled = "rejected";
+        return null;
+      },
+    );
+
+    // Past the old 5 minute total cap, then refreshed by progress twice more.
+    for (const percent of [12, 47, 91]) {
+      await vi.advanceTimersByTimeAsync(9 * 60 * 1000);
+      expect(settled).toBe("pending");
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "project.github.clone.progress",
+          payload: {
+            requestId: "req-clone-idle",
+            repo: "owner/repo",
+            phase: "receiving",
+            percent,
+            detail: "245.55 MiB | 2.10 MiB/s",
+          },
+        }),
+      );
+    }
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1);
+    expect(settled).toBe("pending");
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(clonePromise).rejects.toThrow(
+      "Timeout waiting for message (no activity for 600000ms)",
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("cloneGithubProject ignores clone progress for a different request", async () => {
+  useHeartbeatClock();
+  try {
+    const logger = createMockLogger();
+    const mock = createMockTransport();
+
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_unit_test",
+      logger,
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+
+    const connectPromise = client.connect();
+    mock.triggerOpen();
+    await connectPromise;
+
+    const clonePromise = client.cloneGithubProject(
+      { repo: "owner/repo", targetDirectory: "~/workspace" },
+      "req-clone-mine",
+    );
+    const rejection = expect(clonePromise).rejects.toThrow(
+      "Timeout waiting for message (no activity for 600000ms)",
+    );
+
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1000);
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "project.github.clone.progress",
+        payload: {
+          requestId: "req-clone-other",
+          repo: "other/repo",
+          phase: "receiving",
+          percent: 50,
+          detail: null,
+        },
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(60 * 1000);
+    await rejection;
   } finally {
     vi.useRealTimers();
   }

@@ -6,6 +6,7 @@ import {
   DirectTcpHostConnectionSchema,
   type DirectTcpHostConnection,
 } from "@getpaseo/protocol/host-connection-schema";
+import { decodePeerInvite, peerInviteFingerprint } from "@getpaseo/protocol/dht-peer";
 import {
   DEFAULT_SSH_DAEMON_PORT,
   validatePort,
@@ -48,12 +49,22 @@ export interface RelayHostConnection {
   daemonPublicKeyB64: string;
 }
 
+export interface HyperdhtHostConnection {
+  id: string;
+  type: "hyperdht";
+  /** paseo-peer://v1/<pk> — knowing the key is the grant; keep out of diagnostics. */
+  invite: string;
+  /** short public-key fingerprint, safe to display/log. */
+  publicKeyFingerprint: string;
+}
+
 export type HostConnection =
   | DirectTcpHostConnection
   | DirectSocketHostConnection
   | DirectPipeHostConnection
   | RemoteSshHostConnection
-  | RelayHostConnection;
+  | RelayHostConnection
+  | HyperdhtHostConnection;
 
 export type HostLifecycle = Record<string, never>;
 
@@ -124,31 +135,33 @@ function hostConnectionEquals(left: HostConnection, right: HostConnection): bool
     return false;
   }
 
-  if (left.type === "directTcp" && right.type === "directTcp") {
-    return (
-      left.endpoint === right.endpoint &&
-      (left.useTls ?? false) === (right.useTls ?? false) &&
-      left.password === right.password
-    );
+  switch (left.type) {
+    case "directTcp": {
+      const r = right as typeof left;
+      return (
+        left.endpoint === r.endpoint &&
+        (left.useTls ?? false) === (r.useTls ?? false) &&
+        left.password === r.password
+      );
+    }
+    case "directSocket":
+    case "directPipe":
+      return left.path === (right as typeof left).path;
+    case "remoteSsh":
+      return remoteSshConnectionEquals(left, right as typeof left);
+    case "relay": {
+      const r = right as typeof left;
+      return (
+        left.relayEndpoint === r.relayEndpoint &&
+        left.useTls === r.useTls &&
+        left.daemonPublicKeyB64 === r.daemonPublicKeyB64
+      );
+    }
+    case "hyperdht":
+      return left.invite === (right as typeof left).invite;
+    default:
+      return false;
   }
-  if (left.type === "directSocket" && right.type === "directSocket") {
-    return left.path === right.path;
-  }
-  if (left.type === "directPipe" && right.type === "directPipe") {
-    return left.path === right.path;
-  }
-  if (left.type === "remoteSsh" && right.type === "remoteSsh") {
-    return remoteSshConnectionEquals(left, right);
-  }
-  if (left.type === "relay" && right.type === "relay") {
-    return (
-      left.relayEndpoint === right.relayEndpoint &&
-      left.useTls === right.useTls &&
-      left.daemonPublicKeyB64 === right.daemonPublicKeyB64
-    );
-  }
-
-  return false;
 }
 
 function remoteSshConnectionEquals(
@@ -383,6 +396,14 @@ const StoredHostConnectionSchema = z.discriminatedUnion("type", [
     useTls: z.boolean().optional(),
     daemonPublicKeyB64: z.string(),
   }),
+  z.strictObject({
+    id: z.string().optional(),
+    type: z.literal("hyperdht"),
+    invite: z.string(),
+    // Persisted because the runtime connection is written verbatim; the value is
+    // re-derived from the invite on load, so it is accepted and ignored.
+    publicKeyFingerprint: z.string().optional(),
+  }),
 ]);
 const StoredHostProfileSchema = z.strictObject({
   serverId: z.string().trim().min(1),
@@ -448,6 +469,13 @@ function normalizeStoredConnection(connection: StoredHostConnection): HostConnec
       return null;
     }
   }
+  if (connection.type === "hyperdht") {
+    try {
+      return hyperdhtConnectionFromInvite(connection.invite);
+    } catch {
+      return null;
+    }
+  }
 
   return null;
 }
@@ -494,4 +522,19 @@ export function hostHasConnection(host: HostProfile, connection: HostConnection)
 
 export function registryHasConnection(hosts: HostProfile[], connection: HostConnection): boolean {
   return hosts.some((host) => hostHasConnection(host, connection));
+}
+
+/**
+ * Build a HyperDHT host connection from a scanned/pasted `paseo-peer://` invite.
+ * Throws if the invite is malformed. The invite is a bearer grant stored as
+ * local app data; only the fingerprint is safe to surface.
+ */
+export function hyperdhtConnectionFromInvite(invite: string): HyperdhtHostConnection {
+  const fingerprint = peerInviteFingerprint(decodePeerInvite(invite.trim()));
+  return {
+    id: `hyperdht:${fingerprint}`,
+    type: "hyperdht",
+    invite: invite.trim(),
+    publicKeyFingerprint: fingerprint,
+  };
 }

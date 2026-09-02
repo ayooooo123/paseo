@@ -60,6 +60,8 @@ import {
   buildCloneLocationOptions,
   buildManualGithubRepositoryChoices,
   buildSuggestedParentDirectories,
+  cloneProgressText,
+  CLONE_STARTING_TEXT,
   filterAddProjectHosts,
   joinDirectoryPath,
   pathBaseName,
@@ -173,8 +175,8 @@ function directoryOptionSubtitle(option: ProjectPickerOption, shortPath: string)
   return option.path;
 }
 
-function progressText(page: AddProjectPage): string {
-  if (page.kind === "github-location") return "Cloning project...";
+function progressText(page: AddProjectPage, cloneProgress: string | null): string {
+  if (page.kind === "github-location") return cloneProgress ?? CLONE_STARTING_TEXT;
   if (page.kind === "new-directory-name") return "Creating directory...";
   return "Adding project...";
 }
@@ -377,10 +379,22 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
   const inputRef = useRef<EditingTextInputHandle>(null);
   const submissionInFlightRef = useRef(false);
   const browseInFlightRef = useRef(false);
+  const isMountedRef = useRef(true);
+  const cloneProgressUnsubscribeRef = useRef<(() => void) | null>(null);
+  const [cloneProgress, setCloneProgress] = useState<string | null>(null);
   const query = page.kind === "new-directory-name" || page.kind === "method" ? "" : page.query;
   const pageInputValueRef = useRef(page.kind === "method" ? "" : pageInput(page));
   pageInputValueRef.current = page.kind === "method" ? "" : pageInput(page);
   const [debouncedQuery, setDebouncedQuery] = useState(query);
+
+  useEffect(
+    () => () => {
+      isMountedRef.current = false;
+      cloneProgressUnsubscribeRef.current?.();
+      cloneProgressUnsubscribeRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     setState((current) =>
@@ -543,14 +557,23 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
     async (locationPage: GithubLocationPage, parentPath: string) => {
       if (submissionInFlightRef.current) return;
       submissionInFlightRef.current = true;
+      setCloneProgress(null);
       setState((current) =>
         setPageStatus(current, "github-location", { isSubmitting: true, error: null }),
       );
+      const requestId = `add-project-clone-${crypto.randomUUID()}`;
+      cloneProgressUnsubscribeRef.current =
+        client?.on("project.github.clone.progress", (message) => {
+          if (message.payload.requestId !== requestId) return;
+          if (!isMountedRef.current) return;
+          setCloneProgress(cloneProgressText(message.payload));
+        }) ?? null;
       try {
         const result = await cloneGithubProject(
           locationPage.repository.cloneUrl,
           parentPath,
           locationPage.repository.cloneProtocol,
+          requestId,
         );
         if (result.ok) {
           lastCloneParentByHost.set(locationPage.hostId, parentPath);
@@ -571,10 +594,13 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
           }),
         );
       } finally {
+        cloneProgressUnsubscribeRef.current?.();
+        cloneProgressUnsubscribeRef.current = null;
+        if (isMountedRef.current) setCloneProgress(null);
         submissionInFlightRef.current = false;
       }
     },
-    [cloneGithubProject, openNewWorkspaceForProject],
+    [client, cloneGithubProject, openNewWorkspaceForProject],
   );
   const rows = useMemo<FlowRowOption[]>(() => {
     if (page.kind === "host") {
@@ -909,7 +935,7 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
             ) : null}
             {isSubmitting ? (
               <Text style={styles.stateText} testID="add-project-flow-progress">
-                {progressText(page)}
+                {progressText(page, cloneProgress)}
               </Text>
             ) : null}
             {!isSubmitting && page.error ? (

@@ -113,6 +113,7 @@ import {
   useHostRuntimeIsConnected,
   useHosts,
 } from "@/runtime/host-runtime";
+import { useAppVisible } from "@/hooks/use-app-visible";
 import { getDaemonStartService } from "@/runtime/daemon-start-service";
 import { usePanelStore } from "@/stores/panel-store";
 import { flushDraftPersistStorage } from "@/stores/draft-store";
@@ -244,6 +245,12 @@ function PushNotificationRouter() {
       }
       lastHandledIdRef.current = identifier;
 
+      // Tapping a push is the earliest signal that this app is about to be in
+      // front of a user, ahead of the AppState flip. Collapse the reconnect
+      // backoff now so the connection is live by the time the route renders
+      // rather than 30s into it.
+      getHostRuntimeStore().retryAllNow();
+
       const data = response.notification.request.content.data as
         | Record<string, unknown>
         | undefined;
@@ -263,6 +270,24 @@ function PushNotificationRouter() {
       subscription.remove();
     };
   }, [openNotification]);
+
+  return null;
+}
+
+/**
+ * Foregrounding is the other signal that a pending reconnect timer is stale.
+ * The OS freezes sockets in the background — on the peer transport hyperdht's
+ * own suspend destroys the stream outright — so coming back always means
+ * redialling, and there is no reason to serve out a backoff earned while the
+ * process was not running.
+ */
+function ForegroundReconnect() {
+  const isVisible = useAppVisible();
+
+  useEffect(() => {
+    if (!isVisible) return;
+    getHostRuntimeStore().retryAllNow();
+  }, [isVisible]);
 
   return null;
 }
@@ -931,6 +956,7 @@ function RuntimeProviders({ children }: { children: ReactNode }) {
   return (
     <HostRuntimeBootstrapProvider>
       <PushNotificationRouter />
+      <ForegroundReconnect />
       <SidebarCalloutProvider>
         <ProvidersWrapper>{children}</ProvidersWrapper>
       </SidebarCalloutProvider>

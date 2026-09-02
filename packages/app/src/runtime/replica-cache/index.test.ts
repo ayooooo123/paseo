@@ -328,11 +328,11 @@ describe("ReplicaCache", () => {
     await writer.flush();
 
     const reader = createCache(storage);
-    expect((await reader.readAgent(SERVER_ID, "agent-1"))?.id).toBe("agent-1");
-    expect((await reader.readTimeline(SERVER_ID, "agent-1"))?.items).toEqual([timelineItem()]);
+    const snapshot = await reader.readChatSnapshot(SERVER_ID, "agent-1");
+    expect(snapshot.agent?.id).toBe("agent-1");
+    expect(snapshot.timeline?.items).toEqual([timelineItem()]);
     expect(storage.reads).toEqual([
-      { serverId: SERVER_ID, kinds: ["agent"], ids: ["agent-1"] },
-      { serverId: SERVER_ID, kinds: ["timeline"], ids: ["agent-1"] },
+      { serverId: SERVER_ID, kinds: ["agent", "timeline"], ids: ["agent-1"] },
     ]);
   });
 

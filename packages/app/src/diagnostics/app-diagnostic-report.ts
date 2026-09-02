@@ -111,7 +111,7 @@ export function redactAppDiagnosticReport(report: string, hosts: HostProfile[]):
     redacted = redacted.split(value).join("[redacted]");
   }
   return redacted
-    .replace(/paseo:\/\/\S+/gi, "paseo://[redacted]")
+    .replace(/paseo(?:-peer)?:\/\/\S+/gi, "paseo://[redacted]")
     .replace(
       /([?&](?:password|token|secret|key|publicKey|daemonPublicKeyB64)=)[^&\s"']+/gi,
       "$1[redacted]",
@@ -135,6 +135,10 @@ function collectSensitiveHostValues(hosts: HostProfile[]): string[] {
         values.add(connection.daemonPublicKeyB64);
       } else if (connection.type === "directSocket" || connection.type === "directPipe") {
         values.add(connection.path);
+      } else if (connection.type === "hyperdht") {
+        // The invite embeds the capability bearer secret; never leak it. The
+        // fingerprint (id) is safe and already added above.
+        values.add(connection.invite);
       }
     }
   }

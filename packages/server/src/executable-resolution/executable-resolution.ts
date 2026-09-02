@@ -16,11 +16,33 @@ function hasPathSeparator(value: string): boolean {
   return value.includes("/") || value.includes("\\");
 }
 
+/**
+ * Where a CLI lives when PATH does not say so.
+ *
+ * A daemon launched from a GUI context — Finder, the Dock, a login item with no
+ * PATH of its own — inherits the bare macOS launchd PATH,
+ * `/usr/bin:/bin:/usr/sbin:/sbin`. Homebrew is not on it, so `gh` resolves to
+ * nothing and the feature reports itself unavailable with no hint that the tool
+ * is installed and working two directories away. Consulted only after PATH has
+ * already failed, so a PATH the user controls always wins.
+ */
+const FALLBACK_BIN_DIRS = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/opt/local/bin",
+  ...(process.env.HOME ? [`${process.env.HOME}/.local/bin`] : []),
+];
+
 async function enumerateCandidates(name: string): Promise<string[]> {
-  if (process.platform !== "win32" && existsSync("/usr/bin/which")) {
-    return enumerateCandidatesViaSystemWhich(name);
-  }
-  return enumerateCandidatesViaLibrary(name);
+  const found =
+    process.platform !== "win32" && existsSync("/usr/bin/which")
+      ? await enumerateCandidatesViaSystemWhich(name)
+      : await enumerateCandidatesViaLibrary(name);
+  if (found.length > 0 || process.platform === "win32") return found;
+
+  return FALLBACK_BIN_DIRS.map((dir) => `${dir}/${name}`).filter((candidate) =>
+    existsSync(candidate),
+  );
 }
 
 async function enumerateCandidatesViaSystemWhich(name: string): Promise<string[]> {

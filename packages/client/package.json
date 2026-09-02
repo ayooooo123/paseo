@@ -24,6 +24,10 @@
     "./internal/daemon-client-websocket-transport": {
       "types": "./dist/daemon-client-websocket-transport.d.ts",
       "default": "./dist/daemon-client-websocket-transport.js"
+    },
+    "./internal/dht-transport": {
+      "types": "./dist/dht-transport.d.ts",
+      "default": "./dist/dht-transport.js"
     }
   },
   "publishConfig": {
@@ -41,6 +45,7 @@
   "dependencies": {
     "@getpaseo/protocol": "0.7.2",
     "@getpaseo/relay": "0.7.2",
+    "hyperdht": "^6.20.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

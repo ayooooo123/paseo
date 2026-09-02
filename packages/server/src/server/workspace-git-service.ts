@@ -87,6 +87,7 @@ const DEGRADED_GIT_POLL_INTERVAL_MS = 5_000;
 // retains subprocess and event-loop headroom during large workspace reconciliation bursts.
 export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
 export const WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY = 2;
+export const WORKSPACE_GIT_FETCH_CONCURRENCY = 2;
 export const WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS = 10_000;
 const WATCH_RECOVERY_BASE_DELAY_MS = 30_000;
 const WATCH_RECOVERY_MAX_ATTEMPTS = 3;
@@ -422,6 +423,7 @@ interface RepoGitTarget {
   fallbackPollTimer: NodeJS.Timeout | null;
   recovery: WatchRecoveryState;
   intervalId: NodeJS.Timeout | null;
+  fetchQueued: boolean;
   fetchInFlight: boolean;
   bufferedFetchMetadataEvents: FileChange[];
   recentFetchRemoteRefChanges: Map<
@@ -530,6 +532,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   });
   private readonly workspaceObservationSetupLimit = pLimit({
     concurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
+    rejectOnClear: true,
+  });
+  private readonly workspaceFetchLimit = pLimit({
+    concurrency: WORKSPACE_GIT_FETCH_CONCURRENCY,
     rejectOnClear: true,
   });
   private readonly disposeController = new AbortController();
@@ -969,6 +975,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.disposeController.abort(new WorkspaceGitServiceDisposedError());
     this.workspaceRefreshLimit.clearQueue();
     this.workspaceObservationSetupLimit.clearQueue();
+    this.workspaceFetchLimit.clearQueue();
 
     for (const target of this.workspaceTargets.values()) {
       this.closeWorkspaceTarget(target);
@@ -1787,6 +1794,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       fallbackPollTimer: null,
       recovery: { attemptCount: 0, timer: null },
       intervalId: null,
+      fetchQueued: false,
       fetchInFlight: false,
       bufferedFetchMetadataEvents: [],
       recentFetchRemoteRefChanges: new Map(),
@@ -3128,11 +3136,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private async runRepoFetch(target: RepoGitTarget): Promise<void> {
-    if (target.fetchInFlight) {
+    if (target.fetchQueued || target.fetchInFlight) {
       return;
     }
 
-    target.fetchInFlight = true;
+    target.fetchQueued = true;
     this.logger.debug(
       { repoGitRoot: target.repoGitRoot, cwd: target.cwd },
       "Running background git fetch",
@@ -3141,27 +3149,40 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     let result: WorkspaceGitFetchResult | null = null;
     const eventsBeforeFetchSnapshot: FileChange[] = [];
     try {
-      try {
-        result = await this.deps.runGitFetch(
-          target.cwd,
-          {
-            onRefSnapshot: (phase) => {
-              const events = target.bufferedFetchMetadataEvents.splice(0);
-              if (phase === "before") {
-                eventsBeforeFetchSnapshot.push(...events);
-              }
+      await this.workspaceFetchLimit(async () => {
+        target.fetchQueued = false;
+        if (target.closed || this.disposeController.signal.aborted) {
+          return;
+        }
+        target.fetchInFlight = true;
+        try {
+          result = await this.deps.runGitFetch(
+            target.cwd,
+            {
+              onRefSnapshot: (phase) => {
+                const events = target.bufferedFetchMetadataEvents.splice(0);
+                if (phase === "before") {
+                  eventsBeforeFetchSnapshot.push(...events);
+                }
+              },
             },
-          },
-          createRunGitCommand("background-fetch"),
-        );
-      } catch (error) {
-        this.logger.warn(
-          { err: error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
-          "Background git fetch failed",
-        );
+            createRunGitCommand("background-fetch"),
+          );
+        } catch (error) {
+          this.logger.warn(
+            { err: error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
+            "Background git fetch failed",
+          );
+        } finally {
+          target.fetchInFlight = false;
+        }
+      });
+      if (target.closed || this.disposeController.signal.aborted) {
+        return;
       }
       this.applyRepoFetchResult(target, result, eventsBeforeFetchSnapshot);
     } finally {
+      target.fetchQueued = false;
       target.fetchInFlight = false;
     }
   }

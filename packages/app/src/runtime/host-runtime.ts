@@ -14,6 +14,7 @@ import {
   upsertHostConnectionInProfiles,
   registryHasConnection,
   StoredHostRegistrySchema,
+  hyperdhtConnectionFromInvite,
   type HostConnection,
   type HostProfile,
 } from "@/types/host-connection";
@@ -33,6 +34,8 @@ import { connectToDaemon } from "@/utils/test-daemon-connection";
 import { getOrCreateClientId } from "@/utils/client-id";
 import { z } from "zod";
 import { readValidatedJson, readValidatedString } from "@/storage/validated-storage";
+import { createBareDhtTransportFactory } from "@/runtime/dht/bare-dht-transport";
+import { resolveDhtWorkerBundle } from "@/runtime/dht/dht-worker-bundle";
 import {
   selectBestConnection,
   type ConnectionCandidate,
@@ -83,7 +86,8 @@ export type ActiveConnection =
   | { type: "directSocket"; endpoint: string; display: "socket" }
   | { type: "directPipe"; endpoint: string; display: "pipe" }
   | { type: "remoteSsh"; endpoint: string; display: string }
-  | { type: "relay"; endpoint: string; display: "relay" };
+  | { type: "relay"; endpoint: string; display: "relay" }
+  | { type: "hyperdht"; endpoint: string; display: "p2p" };
 
 export type HostRuntimeAgentDirectoryStatus =
   | "idle"
@@ -225,6 +229,13 @@ function toActiveConnection(connection: HostConnection): ActiveConnection {
       type: "directTcp",
       endpoint: connection.endpoint,
       display: connection.endpoint,
+    };
+  }
+  if (connection.type === "hyperdht") {
+    return {
+      type: "hyperdht",
+      endpoint: connection.publicKeyFingerprint,
+      display: "p2p",
     };
   }
   return {
@@ -546,6 +557,25 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
             useTls: connection.useTls ?? false,
           }),
           ...(connection.password ? { password: connection.password } : {}),
+        });
+      }
+      if (connection.type === "hyperdht") {
+        const workerBundle = resolveDhtWorkerBundle();
+        if (!workerBundle) {
+          throw new Error("HyperDHT transport unavailable: Bare worker bundle is not built");
+        }
+        return new DaemonClient({
+          ...base,
+          // Sized for the in-transport redial ladder: one dial attempt can burn a
+          // ~11s holepunch abort window and transient failures retry up to
+          // DHT_DIAL_MAX_ATTEMPTS times, so the budget must cover the ladder
+          // plus backoff. A premature timeout here restarts the whole dial.
+          connectTimeoutMs: 60_000,
+          url: "ws://hyperdht.invalid/ws",
+          transportFactory: createBareDhtTransportFactory({
+            invite: connection.invite,
+            workerBundle,
+          }),
         });
       }
       return new DaemonClient({
@@ -1664,7 +1694,7 @@ export class HostRuntimeStore {
       createTimelineReplica({
         serverId: newServerId,
         storage: this.replicaCache,
-        prepareAgent: (agentId) => directory.prepareAgentRoute(agentId),
+        prepareAgent: (agentId, cachedAgent) => directory.prepareAgentRoute(agentId, cachedAgent),
       }),
     );
     controller.adoptReconciledServerId(newServerId);
@@ -1814,6 +1844,22 @@ export class HostRuntimeStore {
         ...(explicitUseTls ? { useTls } : {}),
         daemonPublicKeyB64,
       },
+    });
+  }
+
+  /**
+   * Pair a HyperDHT host from a pasted/scanned `paseo-peer://` invite. Validates
+   * the invite, dials the daemon over the DHT to learn its serverId, then
+   * persists the host. Throws on a malformed invite or a failed probe.
+   */
+  async upsertHyperdhtConnectionFromInvite(
+    invite: string,
+    label?: string,
+  ): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
+    const connection = hyperdhtConnectionFromInvite(invite);
+    return this.probeAndUpsertConnection({
+      connection,
+      ...(label !== undefined ? { label } : {}),
     });
   }
 
@@ -2082,7 +2128,7 @@ export class HostRuntimeStore {
         createTimelineReplica({
           serverId: host.serverId,
           storage: this.replicaCache,
-          prepareAgent: (agentId) => directory.prepareAgentRoute(agentId),
+          prepareAgent: (agentId, cachedAgent) => directory.prepareAgentRoute(agentId, cachedAgent),
         }),
       );
       const initialSnapshot = controller.getSnapshot();
@@ -2229,6 +2275,21 @@ export class HostRuntimeStore {
 
   getClient(serverId: string): DaemonClient | null {
     return this.controllers.get(serverId)?.getClient() ?? null;
+  }
+
+  /**
+   * Collapse every host's reconnect backoff and dial now.
+   *
+   * Call this when something outside the transport says the world changed: the
+   * app returned to the foreground, or a push arrived. A phone that was asleep
+   * for ten minutes is sitting on a 30s backoff timer it has no reason to
+   * respect, and on the peer transport the OS froze the socket anyway, so the
+   * pending timer is the only thing between the user and a live connection.
+   */
+  retryAllNow(): void {
+    for (const controller of this.controllers.values()) {
+      controller.getClient()?.retryNow();
+    }
   }
 
   subscribe(serverId: string, listener: () => void): () => void {
@@ -2542,6 +2603,10 @@ export interface HostMutations {
     offerUrlOrFragment: string,
     label?: string,
   ) => Promise<HostProfile>;
+  upsertHyperdhtConnectionFromInvite: (
+    invite: string,
+    label?: string,
+  ) => Promise<{ profile: HostProfile; serverId: string; hostname: string | null }>;
   renameHost: (serverId: string, label: string) => Promise<void>;
   setHostColor: (serverId: string, color: HostColor) => Promise<void>;
   setHostBadgeDisplay: (serverId: string, badgeDisplay: HostBadgeDisplay) => Promise<void>;
@@ -2559,6 +2624,8 @@ export function useHostMutations(): HostMutations {
       upsertRelayConnection: (input) => store.upsertRelayConnection(input),
       upsertConnectionFromOffer: (offer, label) => store.upsertConnectionFromOffer(offer, label),
       upsertConnectionFromOfferUrl: (url, label) => store.upsertConnectionFromOfferUrl(url, label),
+      upsertHyperdhtConnectionFromInvite: (invite, label) =>
+        store.upsertHyperdhtConnectionFromInvite(invite, label),
       renameHost: (serverId, label) => store.renameHost(serverId, label),
       setHostColor: (serverId, color) => store.setHostColor(serverId, color),
       setHostBadgeDisplay: (serverId, badgeDisplay) =>

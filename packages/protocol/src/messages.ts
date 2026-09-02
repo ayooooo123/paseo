@@ -1758,10 +1758,8 @@ export const AgentTimelineCursorSchema = z.object({
   seq: z.number().int().nonnegative(),
 });
 
-export const FetchAgentTimelineRequestMessageSchema = z.object({
-  type: z.literal("fetch_agent_timeline_request"),
+const AgentTimelineFetchInputSchema = z.object({
   agentId: z.string(),
-  requestId: z.string(),
   direction: z.enum(["tail", "before", "after"]).optional(),
   cursor: AgentTimelineCursorSchema.optional(),
   // 0 means "all matching rows for this query window".
@@ -1770,6 +1768,11 @@ export const FetchAgentTimelineRequestMessageSchema = z.object({
   projection: z.enum(["projected", "canonical"]).optional(),
   // Allow the client to merge this bounded page outside its contiguous loaded range.
   mergeWindow: z.boolean().optional(),
+});
+
+export const FetchAgentTimelineRequestMessageSchema = AgentTimelineFetchInputSchema.extend({
+  type: z.literal("fetch_agent_timeline_request"),
+  requestId: z.string(),
 });
 
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
@@ -1797,6 +1800,13 @@ export const ProviderSubagentTimelineRequestMessageSchema = z.object({
 export const SetAgentTimelineSubscriptionRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.set_subscription.request"),
   agentIds: z.array(z.string()),
+  requestId: z.string(),
+});
+
+export const SubscribeAndFetchAgentTimelineRequestMessageSchema = z.object({
+  type: z.literal("agent.timeline.subscribe_and_fetch.request"),
+  agentIds: z.array(z.string()),
+  fetch: AgentTimelineFetchInputSchema,
   requestId: z.string(),
 });
 
@@ -3082,6 +3092,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
   SetAgentTimelineSubscriptionRequestMessageSchema,
+  SubscribeAndFetchAgentTimelineRequestMessageSchema,
   AgentForkContextRequestMessageSchema,
   SetAgentModeRequestMessageSchema,
   SetAgentModelRequestMessageSchema,
@@ -3474,6 +3485,8 @@ export const ServerInfoStatusPayloadSchema = z
         forgeProviders: z.boolean().optional(),
         // COMPAT(selectiveAgentTimeline): added in v0.1.106, remove after 2027-01-12.
         selectiveAgentTimeline: z.boolean().optional(),
+        // COMPAT(timelineSubscribeAndFetch): added in v0.7.2, remove after 2027-03-01.
+        timelineSubscribeAndFetch: z.boolean().optional(),
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.
         canonicalSubmittedPrompts: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
@@ -4227,6 +4240,32 @@ export const ProjectGithubCloneResponseSchema = z.object({
   }),
 });
 
+/**
+ * Streamed while a clone runs. A clone of a large repository takes minutes, so
+ * without this the client cannot tell a working transfer from a hung one and the
+ * only feedback available is to cancel. `percent` is absent for phases git does
+ * not quantify; `detail` carries git's own progress text (bytes and rate).
+ */
+export const ProjectGithubCloneProgressPhaseSchema = z.enum([
+  "starting",
+  "counting",
+  "compressing",
+  "receiving",
+  "resolving",
+  "checkout",
+]);
+
+export const ProjectGithubCloneProgressMessageSchema = z.object({
+  type: z.literal("project.github.clone.progress"),
+  payload: z.object({
+    requestId: z.string(),
+    repo: z.string().trim().min(MIN_REPOSITORY_PATH_LENGTH),
+    phase: ProjectGithubCloneProgressPhaseSchema,
+    percent: z.number().min(0).max(100).nullable(),
+    detail: z.string().max(200).nullable(),
+  }),
+});
+
 export const StartWorkspaceScriptResponseMessageSchema = z.object({
   type: z.literal("start_workspace_script_response"),
   payload: z.object({
@@ -4321,9 +4360,8 @@ export const AgentTimelineEntryPayloadSchema = z.object({
   collapsed: z.array(z.enum(["assistant_merge", "reasoning_merge", "tool_lifecycle"])),
 });
 
-export const FetchAgentTimelineResponseMessageSchema = z.object({
-  type: z.literal("fetch_agent_timeline_response"),
-  payload: z.object({
+const createFetchAgentTimelineResponsePayloadSchema = () =>
+  z.object({
     requestId: z.string(),
     agentId: z.string(),
     agent: AgentSnapshotPayloadSchema.nullable(),
@@ -4345,7 +4383,11 @@ export const FetchAgentTimelineResponseMessageSchema = z.object({
     mergeWindow: z.boolean().optional(),
     entries: z.array(AgentTimelineEntryPayloadSchema),
     error: z.string().nullable(),
-  }),
+  });
+
+export const FetchAgentTimelineResponseMessageSchema = z.object({
+  type: z.literal("fetch_agent_timeline_response"),
+  payload: createFetchAgentTimelineResponsePayloadSchema(),
 });
 
 export const AgentTimelineReplacementMessageSchema = z.object({
@@ -4462,6 +4504,15 @@ export const SetAgentTimelineSubscriptionResponseMessageSchema = z.object({
   type: z.literal("agent.timeline.set_subscription.response"),
   payload: z.object({
     agentIds: z.array(z.string()),
+    requestId: z.string(),
+  }),
+});
+
+export const SubscribeAndFetchAgentTimelineResponseMessageSchema = z.object({
+  type: z.literal("agent.timeline.subscribe_and_fetch.response"),
+  payload: z.object({
+    agentIds: z.array(z.string()),
+    timeline: createFetchAgentTimelineResponsePayloadSchema(),
     requestId: z.string(),
   }),
 });
@@ -6362,6 +6413,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   OpenProjectResponseMessageSchema,
   WorkspaceGithubSearchRepositoriesResponseSchema,
   ProjectGithubCloneResponseSchema,
+  ProjectGithubCloneProgressMessageSchema,
   StartWorkspaceScriptResponseMessageSchema,
   WorkspaceScriptListResponseMessageSchema,
   WorkspaceScriptStartResponseMessageSchema,
@@ -6377,6 +6429,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,
   SetAgentTimelineSubscriptionResponseMessageSchema,
+  SubscribeAndFetchAgentTimelineResponseMessageSchema,
   AgentAttentionRequiredMessageSchema,
   AgentForkContextResponseMessageSchema,
   CancelAgentResponseMessageSchema,
@@ -6559,6 +6612,10 @@ export type WorkspaceGithubSearchRepositoriesResponse = z.infer<
 >;
 export type GithubRepository = z.infer<typeof GithubRepositorySchema>;
 export type ProjectGithubCloneResponse = z.infer<typeof ProjectGithubCloneResponseSchema>;
+export type ProjectGithubCloneProgressMessage = z.infer<
+  typeof ProjectGithubCloneProgressMessageSchema
+>;
+export type ProjectGithubCloneProgressPhase = z.infer<typeof ProjectGithubCloneProgressPhaseSchema>;
 export type StartWorkspaceScriptResponseMessage = z.infer<
   typeof StartWorkspaceScriptResponseMessageSchema
 >;

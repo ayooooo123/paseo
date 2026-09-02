@@ -74,6 +74,8 @@ export interface CloneGithubProjectDirectlyInput extends ProjectRegistrationCall
   repo: string;
   targetDirectory: string;
   cloneProtocol?: ProjectGithubCloneProtocol;
+  /** Correlates the clone with its `project.github.clone.progress` messages. */
+  requestId?: string;
   client: Pick<DaemonClient, "cloneGithubProject"> | null;
 }
 
@@ -130,11 +132,14 @@ export async function cloneGithubProjectDirectly(
     return { ok: false, errorCode: null, error: null };
   }
 
-  const payload = await input.client.cloneGithubProject({
-    repo: trimmedRepo,
-    targetDirectory: trimmedTargetDirectory,
-    ...(input.cloneProtocol ? { cloneProtocol: input.cloneProtocol } : {}),
-  });
+  const payload = await input.client.cloneGithubProject(
+    {
+      repo: trimmedRepo,
+      targetDirectory: trimmedTargetDirectory,
+      ...(input.cloneProtocol ? { cloneProtocol: input.cloneProtocol } : {}),
+    },
+    input.requestId,
+  );
   if (payload.error || !payload.project) {
     return { ok: false, errorCode: null, error: payload.error };
   }

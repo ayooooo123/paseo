@@ -167,6 +167,8 @@ import { createConfiguredTerminalManager } from "../terminal/terminal-manager-fa
 import { applyTerminalAgentHookSetting } from "../terminal/agent-hooks/terminal-agent-hook-setting.js";
 import { loadOrCreateDaemonKeyPair } from "./daemon-keypair.js";
 import { createRelayRuntime, type RelayRuntime } from "./relay-runtime.js";
+import { loadOrCreateDhtIdentity } from "./dht/dht-identity.js";
+import { createDhtRuntime, type DhtRuntime } from "./dht/dht-runtime.js";
 import type { PushNotificationSender } from "./push/index.js";
 import { getOrCreateServerId } from "./server-id.js";
 import { resolveDaemonVersion } from "./daemon-version.js";
@@ -416,6 +418,10 @@ export interface PaseoDaemonConfig {
   relayPublicEndpoint?: string;
   relayUseTls?: boolean;
   relayPublicUseTls?: boolean;
+  dhtEnabled?: boolean;
+  dhtBootstrap?: readonly string[];
+  /** Await DHT announce before the daemon reports ready (tests/controlled envs). */
+  dhtBlockingListen?: boolean;
   serviceProxy?: {
     publicBaseUrl: string | null;
     standaloneListen: string | null;
@@ -617,6 +623,7 @@ export async function createPaseoDaemon(
     logger.warn({ err: error }, "Failed to reconcile managed helper process ledger");
   });
   let relayRuntime: RelayRuntime | null = null;
+  let dhtRuntime: DhtRuntime | null = null;
 
   const staticDir = config.staticDir;
   const downloadTokenTtlMs = config.downloadTokenTtlMs ?? 60000;
@@ -1556,6 +1563,7 @@ export async function createPaseoDaemon(
           httpServer.off("listening", onListening);
           reject(err);
         };
+
         const onListening = () => {
           httpServer.off("error", onError);
           mainStarted = true;
@@ -1702,6 +1710,7 @@ export async function createPaseoDaemon(
             daemonConfigStore.onFieldChange("relay.enabled", (value) => {
               relayRuntime?.setEnabled(value === true);
             });
+            dhtRuntime = await initDhtRuntime(config, logger, wsServer);
             await hubRelationships.start();
           };
 
@@ -1753,6 +1762,7 @@ export async function createPaseoDaemon(
     await speechService.stop();
     await scheduleService.stop().catch(() => undefined);
     await relayRuntime?.stop().catch(() => undefined);
+    await dhtRuntime?.stop().catch(() => undefined);
     if (wsServer) {
       await wsServer.close();
     }
@@ -1799,4 +1809,36 @@ async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promi
       }
     }),
   );
+}
+async function initDhtRuntime(
+  config: PaseoDaemonConfig,
+  logger: Logger,
+  wsServer: VoiceAssistantWebSocketServer,
+): Promise<DhtRuntime | null> {
+  const dhtEnabled = config.dhtEnabled ?? process.env.PASEO_DHT_ENABLED === "true";
+  if (!dhtEnabled) return null;
+
+  const dhtIdentity = loadOrCreateDhtIdentity(config.paseoHome, logger);
+  const envBootstrap = (process.env.PASEO_DHT_BOOTSTRAP ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  const dhtBootstrap = config.dhtBootstrap ?? (envBootstrap.length > 0 ? envBootstrap : undefined);
+  const runtime = createDhtRuntime({
+    enabled: true,
+    identity: dhtIdentity,
+    logger,
+    bootstrap: dhtBootstrap,
+    attachSocket: async (ws, metadata) => {
+      await wsServer.attachExternalSocket(ws, metadata);
+    },
+  });
+  logger.info(
+    { publicKeyB64: dhtIdentity.publicKeyB64.slice(0, 12) },
+    "hyperdht_peer_transport_enabled",
+  );
+  if (config.dhtBlockingListen || dhtBootstrap !== undefined) {
+    await runtime.whenListening();
+  }
+  return runtime;
 }

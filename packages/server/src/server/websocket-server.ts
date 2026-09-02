@@ -113,7 +113,7 @@ import {
 const WS_CLOSE_DAEMON_AUTH_FAILED = 4401;
 
 export interface ExternalSocketMetadata {
-  transport: "relay" | "hub";
+  transport: "relay" | "hub" | "hyperdht";
   externalSessionKey?: string;
   relayConnectionId?: string;
   hubDaemonId?: string;
@@ -134,7 +134,7 @@ interface PendingConnection {
 
 interface WebSocketConnectionIdentity {
   connectionId: string;
-  transport: "direct" | "relay" | "hub";
+  transport: "direct" | "relay" | "hub" | "hyperdht";
   peer: "loopback" | "local_ipc" | "external";
   browserOrigin: boolean;
   host?: string;
@@ -1739,6 +1739,8 @@ export class VoiceAssistantWebSocketServer {
         forgeProviders: true,
         // COMPAT(selectiveAgentTimeline): added in v0.1.106, remove after 2027-01-12.
         selectiveAgentTimeline: true,
+        // COMPAT(timelineSubscribeAndFetch): added in v0.7.2, remove after 2027-03-01.
+        timelineSubscribeAndFetch: true,
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.
         canonicalSubmittedPrompts: true,
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
@@ -2677,6 +2679,11 @@ function createWebSocketConnectionIdentity(
 ): WebSocketConnectionIdentity {
   return {
     connectionId: `conn_${randomUUID().replaceAll("-", "")}`,
+    // Carry the bridged transport through instead of collapsing anything that
+    // is not "relay" into "direct". A hyperdht peer arrives as a bridged socket
+    // with no HTTP request, so it read as a direct LAN client in every log line
+    // it produced -- which is exactly the field you reach for when deciding
+    // whether a drop is a local socket or a holepunched stream.
     transport: metadata?.transport ?? "direct",
     peer: resolveConnectionPeer(requestMetadata, metadata),
     browserOrigin: requestMetadata.origin !== undefined,

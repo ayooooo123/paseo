@@ -9,8 +9,8 @@ import {
   type PressableStateCallbackType,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useCallback, useMemo, useState, type ReactElement } from "react";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { memo, useCallback, useMemo, useState, type ReactElement } from "react";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { useIsCompactFormFactor } from "@/constants/layout";
@@ -18,6 +18,7 @@ import { formatTimeAgo } from "@/utils/time";
 import { type AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { useSessionStore } from "@/stores/session-store";
 import { Archive, ChevronRight } from "lucide-react-native";
+import { ICON_SIZE, SPACING, type Theme } from "@/styles/theme";
 import { getProviderIcon } from "@/components/provider-icons";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { useArchiveAgent } from "@/hooks/use-archive-agent";
@@ -49,6 +50,9 @@ interface AgentListProps {
    */
   flat?: boolean;
 }
+
+/** Spacing lives in the string because the meta line is one `Text`, not a flex row. */
+const META_SEPARATOR = " · ";
 
 type DateSectionKey = "today" | "yesterday" | "thisWeek" | "thisMonth" | "older";
 
@@ -107,6 +111,14 @@ function formatDateSectionLabel(t: TFunction, section: DateSectionKey): string {
   }
 }
 
+const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+const ThemedArchive = withUnistyles(Archive, mutedIconMapping);
+const ThemedChevronRight = withUnistyles(ChevronRight, mutedIconMapping);
+const ThemedRefreshControl = withUnistyles(RefreshControl, (theme: Theme) => ({
+  tintColor: theme.colors.foregroundMuted,
+  colors: [theme.colors.foregroundMuted],
+}));
+
 function SessionBadge({
   label,
   icon,
@@ -127,15 +139,11 @@ function WorkspaceTitlePrefix({
   workspaceName,
   ranges,
   testID,
-  iconSize,
-  color,
 }: {
   visible: boolean;
   workspaceName: string;
   ranges?: readonly MatchRange[];
   testID: string;
-  iconSize: number;
-  color: string;
 }) {
   if (!visible) {
     return null;
@@ -150,23 +158,24 @@ function WorkspaceTitlePrefix({
         numberOfLines={1}
         testID={testID}
       />
-      <ChevronRight size={iconSize} color={color} />
+      <ThemedChevronRight size={ICON_SIZE.xs} />
     </>
   );
 }
 
 function SessionRowBadges({
   agent,
-  archivedIcon,
   pendingPermissionCount,
   showDesktopAttention,
 }: {
   agent: AggregatedAgent;
-  archivedIcon: ReactElement;
   pendingPermissionCount: number;
   showDesktopAttention: boolean;
 }) {
   const { t } = useTranslation();
+  // `[]` is honest here: `ThemedArchive` re-renders itself on a theme change, so the element
+  // never has to be rebuilt.
+  const archivedIcon = useMemo(() => <ThemedArchive size={ICON_SIZE.xs} />, []);
   return (
     <>
       {agent.archivedAt ? (
@@ -205,7 +214,7 @@ function SessionRowTrailingAttention({
   );
 }
 
-function SessionRow({
+const SessionRow = memo(function SessionRow({
   agent,
   searchMatches,
   isMobile,
@@ -224,7 +233,6 @@ function SessionRow({
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
 }) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const timeAgo = formatTimeAgo(agent.lastActivityAt);
   const agentKey = `${agent.serverId}:${agent.id}`;
@@ -258,10 +266,6 @@ function SessionRow({
     [isSelected],
   );
 
-  const archivedIcon = useMemo(
-    () => <Archive size={theme.fontSize.sm} color={theme.colors.foregroundMuted} />,
-    [theme.fontSize.sm, theme.colors.foregroundMuted],
-  );
   const showDesktopAttention =
     !isMobile && showAttentionIndicator && Boolean(agent.requiresAttention);
 
@@ -279,11 +283,9 @@ function SessionRow({
             workspaceName={workspaceName}
             ranges={rangesFor("workspace")}
             testID={`agent-row-workspace-${agent.serverId}-${agent.id}`}
-            iconSize={theme.iconSize.xs}
-            color={theme.colors.foregroundMuted}
           />
           <View style={styles.providerIconWrap}>
-            <ProviderIcon size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+            <ProviderIcon size={ICON_SIZE.sm} color={styles.mutedIcon.color} />
           </View>
           <HighlightedText
             text={agent.title || t("agentList.fallbackTitle")}
@@ -293,47 +295,42 @@ function SessionRow({
           />
           <SessionRowBadges
             agent={agent}
-            archivedIcon={archivedIcon}
             pendingPermissionCount={pendingPermissionCount}
             showDesktopAttention={showDesktopAttention}
           />
         </View>
         {isMobile ? (
-          <View style={styles.rowMetaRow}>
+          // One `Text` with virtual children, not a flex row of seven. Nested `Text` never
+          // becomes a host view, so this is the difference between ~12 and ~6 native views per
+          // row — the cost that decides whether a flick keeps up. It also cannot wrap to a
+          // second line, so every row in the list is the same height.
+          <Text style={styles.sessionMetaText} numberOfLines={1}>
             <HighlightedText
               text={projectName}
               ranges={rangesFor("project")}
-              style={styles.sessionMetaText}
-              numberOfLines={1}
               testID={`agent-row-project-${agent.serverId}-${agent.id}`}
             />
-            <Text style={styles.sessionMetaSeparator}>·</Text>
+            <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
             <HighlightedText
               text={branch}
               ranges={rangesFor("branch")}
-              style={styles.sessionMetaText}
-              numberOfLines={1}
               testID={`agent-row-branch-${agent.serverId}-${agent.id}`}
             />
-            <Text style={styles.sessionMetaSeparator}>·</Text>
+            <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
             <HighlightedText
               text={workspaceName}
               ranges={rangesFor("workspace")}
-              style={styles.sessionMetaText}
-              numberOfLines={1}
               testID={`agent-row-workspace-${agent.serverId}-${agent.id}`}
             />
-            <Text style={styles.sessionMetaSeparator}>·</Text>
-            <Text style={styles.sessionMetaText}>{timeAgo}</Text>
+            <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
+            {timeAgo}
             {showHostColumn && agent.serverLabel ? (
               <>
-                <Text style={styles.sessionMetaSeparator}>·</Text>
-                <Text style={styles.sessionMetaText} numberOfLines={1}>
-                  {agent.serverLabel}
-                </Text>
+                <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
+                {agent.serverLabel}
               </>
             ) : null}
-          </View>
+          </Text>
         ) : null}
       </View>
       {!isMobile ? (
@@ -369,7 +366,7 @@ function SessionRow({
       />
     </Pressable>
   );
-}
+});
 
 export function AgentList({
   agents,
@@ -383,7 +380,6 @@ export function AgentList({
   searchMatchesByAgentKey,
   flat = false,
 }: AgentListProps) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const [actionAgent, setActionAgent] = useState<AggregatedAgent | null>(null);
@@ -515,13 +511,9 @@ export function AgentList({
 
   const keyExtractor = useCallback((item: FlatListItem) => item.key, []);
 
-  const refreshColors = useMemo(
-    () => [theme.colors.foregroundMuted],
-    [theme.colors.foregroundMuted],
-  );
   const sheetContainerStyle = useMemo(
-    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, theme.spacing[6]) }],
-    [insets.bottom, theme.spacing],
+    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, SPACING[6]) }],
+    [insets.bottom],
   );
   const sheetArchiveTextStyle = useMemo(
     () => [styles.sheetArchiveText, isActionDaemonUnavailable && styles.sheetArchiveTextDisabled],
@@ -531,14 +523,9 @@ export function AgentList({
   const refreshControl = useMemo(
     () =>
       onRefresh ? (
-        <RefreshControl
-          refreshing={isRefreshing}
-          onRefresh={onRefresh}
-          tintColor={theme.colors.foregroundMuted}
-          colors={refreshColors}
-        />
+        <ThemedRefreshControl refreshing={isRefreshing} onRefresh={onRefresh} />
       ) : undefined,
-    [onRefresh, isRefreshing, theme.colors.foregroundMuted, refreshColors],
+    [onRefresh, isRefreshing],
   );
 
   return (
@@ -553,6 +540,12 @@ export function AgentList({
         keyboardShouldPersistTaps="handled"
         ListFooterComponent={listFooterComponent}
         refreshControl={refreshControl}
+        // A history page is 200 rows per host. Defaults keep ten screens of them mounted and
+        // render 10 more per batch, which is what makes a flick on a phone drop frames.
+        initialNumToRender={14}
+        maxToRenderPerBatch={6}
+        updateCellsBatchingPeriod={50}
+        windowSize={5}
       />
 
       <Modal
@@ -652,18 +645,14 @@ const styles = StyleSheet.create((theme) => ({
     alignItems: "center",
     justifyContent: "center",
   },
+  mutedIcon: {
+    color: theme.colors.foregroundMuted,
+  },
   workspaceTitleText: {
     flexShrink: 0,
     maxWidth: 220,
     fontSize: theme.fontSize.base,
     color: theme.colors.foregroundMuted,
-  },
-  rowMetaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: theme.spacing[1],
-    marginTop: 2,
   },
   rowTrailing: {
     marginLeft: theme.spacing[2],
@@ -690,6 +679,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   sessionMetaText: {
     maxWidth: "100%",
+    marginTop: 2,
     fontSize: theme.fontSize.base,
     color: theme.colors.foregroundMuted,
   },

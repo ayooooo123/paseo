@@ -3,8 +3,17 @@ import {
   parseGitHubRemoteUrl,
   parseGitRemoteLocation,
 } from "@getpaseo/protocol/git-remote";
+import type {
+  ProjectGithubCloneProgressMessage,
+  ProjectGithubCloneProgressPhase,
+} from "@getpaseo/protocol/messages";
 import { shortenPath } from "@/utils/shorten-path";
 import type { AddProjectHost, GithubRepositoryChoice } from "./model";
+
+/** Shown while a clone runs before the host reports any progress. */
+export const CLONE_STARTING_TEXT = "Cloning project...";
+
+type ProjectGithubCloneProgressPayload = ProjectGithubCloneProgressMessage["payload"];
 
 export type AddProjectMethodId = "directory-search" | "browse" | "github" | "new-directory";
 
@@ -69,6 +78,25 @@ export function addProjectMethodEmptyText(host: AddProjectHost | null): string {
   return host?.canAddProject === false
     ? "Update the host to use Add Project."
     : "No matching options";
+}
+
+const CLONE_PROGRESS_PHASE_LABELS: Record<ProjectGithubCloneProgressPhase, string> = {
+  starting: CLONE_STARTING_TEXT,
+  counting: "Counting objects",
+  compressing: "Compressing objects",
+  receiving: "Receiving objects",
+  resolving: "Resolving deltas",
+  checkout: "Checking out files",
+};
+
+/**
+ * Renders one clone progress update, e.g. `Receiving objects 42% · 245.55 MiB | 2.10 MiB/s`.
+ * Phases git does not quantify carry no percent, and only git supplies the detail suffix.
+ */
+export function cloneProgressText(payload: ProjectGithubCloneProgressPayload): string {
+  const percent = payload.percent === null ? "" : ` ${Math.round(payload.percent)}%`;
+  const detail = payload.detail ? ` · ${payload.detail}` : "";
+  return `${CLONE_PROGRESS_PHASE_LABELS[payload.phase]}${percent}${detail}`;
 }
 
 function githubMethodDescription(host: AddProjectHost): string {

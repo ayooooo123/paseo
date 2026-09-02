@@ -114,6 +114,9 @@ function formatHostConnectionLabel(connection: HostConnection, t: TFunction): st
   if (connection.type === "remoteSsh") {
     return `${t("settings.host.badges.remoteSsh")} (${connection.host})`;
   }
+  if (connection.type === "hyperdht") {
+    return `P2P (${connection.publicKeyFingerprint})`;
+  }
   return `TCP (${connection.endpoint})`;
 }
 

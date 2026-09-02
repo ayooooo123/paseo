@@ -12,6 +12,8 @@ import {
   buildDesktopDaemonTransportUrl,
   createDesktopDaemonTransportFactory,
 } from "@/desktop/daemon/desktop-daemon-transport";
+import { createBareDhtTransportFactory } from "@/runtime/dht/bare-dht-transport";
+import { resolveDhtWorkerBundle } from "@/runtime/dht/dht-worker-bundle";
 import type { DesktopDaemonTransportTarget } from "@/desktop/daemon/desktop-daemon";
 
 export interface DaemonProbeClient {
@@ -113,6 +115,26 @@ export class DaemonConnectionTestError extends Error {
   }
 }
 
+function buildHyperdhtClientConfig(
+  connection: Extract<HostConnection, { type: "hyperdht" }>,
+  base: Omit<DaemonClientConfig, "url">,
+  timeoutMs: number,
+): DaemonClientConfig {
+  const workerBundle = resolveDhtWorkerBundle();
+  if (!workerBundle) {
+    throw new Error("HyperDHT transport unavailable: Bare worker bundle is not built");
+  }
+  return {
+    ...base,
+    connectTimeoutMs: timeoutMs,
+    url: "ws://hyperdht.invalid/ws",
+    transportFactory: createBareDhtTransportFactory({
+      invite: connection.invite,
+      workerBundle,
+    }),
+  };
+}
+
 export async function buildClientConfig(
   connection: HostConnection,
   serverId?: string,
@@ -169,6 +191,10 @@ export async function buildClientConfig(
       url: buildDaemonWebSocketUrl(connection.endpoint, { useTls: connection.useTls ?? false }),
       ...(connection.password ? { password: connection.password } : {}),
     };
+  }
+
+  if (connection.type === "hyperdht") {
+    return buildHyperdhtClientConfig(connection, base, resolveTimeout(connection, options));
   }
 
   if (!serverId) {
@@ -264,6 +290,12 @@ interface ProbeOptions {
 
 function resolveTimeout(connection: HostConnection, options?: ProbeOptions): number {
   if (options?.timeoutMs) return options.timeoutMs;
+  // A cold HyperDHT dial bootstraps the node, looks the peer up in the DHT, and
+  // holepunches before a single byte moves, and transient aborts are retried
+  // in-transport (each attempt can burn a ~11s holepunch window). The budget
+  // must outlast the ladder or pairing reports a timeout for a dial that
+  // would have connected.
+  if (connection.type === "hyperdht") return 60_000;
   if (connection.type === "relay") return 10_000;
   if (connection.type === "remoteSsh") return 15_000;
   return 6_000;

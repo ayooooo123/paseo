@@ -22,6 +22,7 @@ import {
   type ProjectPlacementPayload,
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
+  type ProjectGithubCloneProgressPhase,
 } from "./messages.js";
 import type {
   TerminalManager,
@@ -33,6 +34,7 @@ import type { BinaryFrame } from "@getpaseo/protocol/binary-frames/index";
 import { CursorError } from "./pagination/cursor.js";
 import { SortablePager, type SortSpec } from "./pagination/sortable-pager.js";
 import { describeAgentHistoryMatches, rankAgentHistoryCandidates } from "./agent-history-search.js";
+import { parseGitCloneProgress, type GitCloneProgressUpdate } from "./git-clone-progress.js";
 import type { SpeechToTextProvider, TextToSpeechProvider } from "./speech/speech-provider.js";
 import type { TurnDetectionProvider } from "./speech/turn-detection-provider.js";
 import {
@@ -326,6 +328,12 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
 }
 
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
+
+/**
+ * Git narrates every object it moves; a mobile socket only needs a heartbeat.
+ * A phase change always goes out immediately, everything else waits this long.
+ */
+const CLONE_PROGRESS_THROTTLE_MS = 250;
 
 export function resolveWaitForFinishError(options: {
   status: "permission" | "error" | "idle";
@@ -2252,6 +2260,8 @@ export class Session {
     switch (msg.type) {
       case "fetch_agent_timeline_request":
         return this.handleFetchAgentTimelineRequest(msg, source);
+      case "agent.timeline.subscribe_and_fetch.request":
+        return this.handleSubscribeAndFetchAgentTimelineRequest(msg, source);
       case "agent.timeline.list_prompts.request":
         return this.handleAgentTimelineListPromptsRequest(msg, source);
       case "agent.provider_subagents.list.request":
@@ -6401,13 +6411,44 @@ export class Session {
         }
       }
 
+      let lastProgressPhase: ProjectGithubCloneProgressPhase | null = null;
+      let lastProgressAt = 0;
+      const emitCloneProgress = (update: GitCloneProgressUpdate) => {
+        lastProgressPhase = update.phase;
+        lastProgressAt = Date.now();
+        this.emit({
+          type: "project.github.clone.progress",
+          payload: {
+            requestId: request.requestId,
+            repo: repo.displayName,
+            phase: update.phase,
+            percent: update.percent,
+            detail: update.detail,
+          },
+        });
+      };
+      emitCloneProgress({ phase: "starting", percent: null, detail: null });
+
       const cloneStagingPath = await mkdtemp(resolve(targetParent, ".paseo-clone-"));
       try {
-        await runGitCommand(["clone", repo.cloneUrl, cloneStagingPath], {
+        await runGitCommand(["clone", "--progress", repo.cloneUrl, cloneStagingPath], {
           cwd: targetParent,
-          timeout: 5 * 60 * 1000,
+          // A clone takes as long as the repository is big; only a stalled
+          // transfer is a failure. `--progress` keeps git talking while it works.
+          idleTimeout: 60 * 1000,
           maxOutputBytes: 1024 * 1024,
           logger: this.sessionLogger,
+          onOutput: (text) => {
+            const update = parseGitCloneProgress(text);
+            if (!update) return;
+            if (
+              update.phase === lastProgressPhase &&
+              Date.now() - lastProgressAt < CLONE_PROGRESS_THROTTLE_MS
+            ) {
+              return;
+            }
+            emitCloneProgress(update);
+          },
         });
         await rename(cloneStagingPath, checkoutPath);
       } catch (error) {
@@ -6979,6 +7020,41 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
     source?: object,
   ): Promise<void> {
+    const payload = await this.buildFetchAgentTimelinePayload(msg, source);
+    this.emitForSource({ type: "fetch_agent_timeline_response", payload }, source);
+  }
+
+  private async handleSubscribeAndFetchAgentTimelineRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.timeline.subscribe_and_fetch.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const agentIds = [...new Set(msg.agentIds)].sort();
+    if (
+      source
+        ? this.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, source)
+        : this.supports(CLIENT_CAPS.selectiveAgentTimeline)
+    ) {
+      this.replaceAgentTimelineSubscription(source, agentIds);
+    }
+    const timeline = await this.buildFetchAgentTimelinePayload(
+      { type: "fetch_agent_timeline_request", ...msg.fetch, requestId: msg.requestId },
+      source,
+    );
+    this.emitForSource(
+      {
+        type: "agent.timeline.subscribe_and_fetch.response",
+        payload: { agentIds, timeline, requestId: msg.requestId },
+      },
+      source,
+    );
+  }
+
+  private async buildFetchAgentTimelinePayload(
+    msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
+    source?: object,
+  ): Promise<
+    Extract<SessionOutboundMessage, { type: "fetch_agent_timeline_response" }>["payload"]
+  > {
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     const projection: TimelineProjectionMode = msg.projection ?? "projected";
     const requestedLimit = msg.limit;
@@ -7020,80 +7096,68 @@ export class Session {
           ? { epoch: selectedTimeline.timeline.epoch, seq: selectedTimeline.endSeq }
           : null;
 
-      this.emitForSource(
-        {
-          type: "fetch_agent_timeline_response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            agent: agentPayload,
-            direction,
-            projection,
-            epoch: selectedTimeline.timeline.epoch,
-            reset: fetchedControlTimeline.reset,
-            staleCursor: fetchedControlTimeline.staleCursor,
-            gap: fetchedControlTimeline.gap,
-            window: selectedTimeline.timeline.window,
-            startCursor,
-            endCursor,
-            hasOlder: selectedTimeline.hasOlder,
-            hasNewer: selectedTimeline.hasNewer,
-            ...(msg.mergeWindow === true ? { mergeWindow: true } : {}),
-            entries: selectedTimeline.entries.map((entry) => {
-              const payloadEntry = {
-                provider: snapshot.provider,
-                item: entry.item,
-                timestamp: entry.timestamp,
-                seqStart: entry.seqStart,
-                seqEnd: entry.seqEnd,
-                sourceSeqRanges: entry.sourceSeqRanges,
-                turnId: undefined as string | undefined,
-                collapsed: (
-                  source
-                    ? this.supportsForSource(CLIENT_CAPS.reasoningMergeEnum, source)
-                    : this.supports(CLIENT_CAPS.reasoningMergeEnum)
-                )
-                  ? entry.collapsed
-                  : entry.collapsed.filter((value) => value !== "reasoning_merge"),
-              };
-              payloadEntry.turnId = entry.turnId;
-              return payloadEntry;
-            }),
-            error: null,
-          },
-        },
-        source,
-      );
+      return {
+        requestId: msg.requestId,
+        agentId: msg.agentId,
+        agent: agentPayload,
+        direction,
+        projection,
+        epoch: selectedTimeline.timeline.epoch,
+        reset: fetchedControlTimeline.reset,
+        staleCursor: fetchedControlTimeline.staleCursor,
+        gap: fetchedControlTimeline.gap,
+        window: selectedTimeline.timeline.window,
+        startCursor,
+        endCursor,
+        hasOlder: selectedTimeline.hasOlder,
+        hasNewer: selectedTimeline.hasNewer,
+        ...(msg.mergeWindow === true ? { mergeWindow: true } : {}),
+        entries: selectedTimeline.entries.map((entry) => {
+          const payloadEntry = {
+            provider: snapshot.provider,
+            item: entry.item,
+            timestamp: entry.timestamp,
+            seqStart: entry.seqStart,
+            seqEnd: entry.seqEnd,
+            sourceSeqRanges: entry.sourceSeqRanges,
+            turnId: undefined as string | undefined,
+            collapsed: (
+              source
+                ? this.supportsForSource(CLIENT_CAPS.reasoningMergeEnum, source)
+                : this.supports(CLIENT_CAPS.reasoningMergeEnum)
+            )
+              ? entry.collapsed
+              : entry.collapsed.filter((value) => value !== "reasoning_merge"),
+          };
+          payloadEntry.turnId = entry.turnId;
+          return payloadEntry;
+        }),
+        error: null,
+      };
     } catch (error) {
       this.sessionLogger.error(
         { err: error, agentId: msg.agentId },
         "Failed to handle fetch_agent_timeline_request",
       );
-      this.emitForSource(
-        {
-          type: "fetch_agent_timeline_response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            agent: null,
-            direction,
-            projection,
-            epoch: "",
-            reset: false,
-            staleCursor: false,
-            gap: false,
-            window: { minSeq: 0, maxSeq: 0, nextSeq: 0 },
-            startCursor: null,
-            endCursor: null,
-            hasOlder: false,
-            hasNewer: false,
-            ...(msg.mergeWindow === true ? { mergeWindow: true } : {}),
-            entries: [],
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-        source,
-      );
+      return {
+        requestId: msg.requestId,
+        agentId: msg.agentId,
+        agent: null,
+        direction,
+        projection,
+        epoch: "",
+        reset: false,
+        staleCursor: false,
+        gap: false,
+        window: { minSeq: 0, maxSeq: 0, nextSeq: 0 },
+        startCursor: null,
+        endCursor: null,
+        hasOlder: false,
+        hasNewer: false,
+        ...(msg.mergeWindow === true ? { mergeWindow: true } : {}),
+        entries: [],
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 

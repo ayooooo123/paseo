@@ -504,4 +504,41 @@ describe("viewed timeline subscription messages", () => {
       },
     });
   });
+
+  test("parses an atomic subscription and focused timeline response", () => {
+    const request = SessionInboundMessageSchema.parse({
+      type: "agent.timeline.subscribe_and_fetch.request",
+      agentIds: ["agent-a"],
+      fetch: { agentId: "agent-a", direction: "after", cursor: { epoch: "e", seq: 4 } },
+      requestId: "bootstrap-1",
+    });
+    const response = SessionOutboundMessageSchema.parse({
+      type: "agent.timeline.subscribe_and_fetch.response",
+      payload: {
+        agentIds: ["agent-a"],
+        requestId: "bootstrap-1",
+        timeline: {
+          requestId: "bootstrap-1",
+          agentId: "agent-a",
+          agent: null,
+          direction: "after",
+          projection: "projected",
+          epoch: "e",
+          reset: false,
+          staleCursor: false,
+          gap: false,
+          window: { minSeq: 1, maxSeq: 4, nextSeq: 5 },
+          startCursor: null,
+          endCursor: null,
+          hasOlder: true,
+          hasNewer: false,
+          entries: [],
+          error: null,
+        },
+      },
+    });
+
+    expect(request.type).toBe("agent.timeline.subscribe_and_fetch.request");
+    expect(response.type).toBe("agent.timeline.subscribe_and_fetch.response");
+  });
 });

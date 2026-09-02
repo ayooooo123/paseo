@@ -453,7 +453,26 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     );
     const sync = getHostRuntimeStore().createViewedTimelineOwner(serverId, {
       initialDeliveryMode,
-      setSubscription: (agentIds) => client.setAgentTimelineSubscription(agentIds),
+      setSubscription: async (agentIds, bootstrap) => {
+        // COMPAT(timelineSubscribeAndFetch): added in v0.7.2, remove after 2027-03-01.
+        if (
+          bootstrap &&
+          client.getLastServerInfoMessage()?.features?.timelineSubscribeAndFetch === true
+        ) {
+          const payload = await client.subscribeAndFetchAgentTimeline(
+            agentIds,
+            bootstrap.agentId,
+            bootstrap.request,
+          );
+          applyTimelineResponse(payload);
+          return {
+            agentId: bootstrap.agentId,
+            page: { hasNewer: payload.hasNewer, endCursor: payload.endCursor },
+          };
+        }
+        await client.setAgentTimelineSubscription(agentIds);
+        return undefined;
+      },
       readCursor: (agentId) => {
         const timeline = selectAgentTimelineState(
           useSessionStore.getState().sessions[serverId],
@@ -524,7 +543,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       setViewedTimelineSync(serverId, null);
       sync.dispose();
     };
-  }, [client, serverId, setInitializingAgents, setViewedTimelineSync]);
+  }, [applyTimelineResponse, client, serverId, setInitializingAgents, setViewedTimelineSync]);
 
   useEffect(() => {
     viewedTimelineSyncRef.current?.setConnected(isConnected);

@@ -178,7 +178,10 @@ const perfNow: () => number =
     ? () => performance.now()
     : () => Date.now();
 
-const PROJECT_GITHUB_CLONE_TIMEOUT_MS = 5 * 60 * 1000;
+// Cloning a large repository can legitimately run for a long time, so the clone request is not
+// capped on total duration: the deadline is refreshed by every clone progress message and only
+// fires once nothing at all has been heard from the daemon for this long.
+const PROJECT_GITHUB_CLONE_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface ImportAgentInputBase {
   cwd?: string;
@@ -814,6 +817,10 @@ interface Waiter<T> {
   reject(error: Error): void;
   timeoutHandle: ReturnType<typeof setTimeout> | null;
   requestId?: string;
+  /** Messages this waiter treats as liveness, refreshing its deadline instead of settling it. */
+  refreshDeadlineOn?: (msg: SessionOutboundMessage) => boolean;
+  /** Restarts the timeout window; only present while a timeout is armed. */
+  refreshDeadline?: () => void;
 }
 
 interface WaitHandle<T> {
@@ -824,6 +831,11 @@ interface WaitHandle<T> {
 interface WaitOptions {
   skipQueue?: boolean;
   requestId?: string;
+  /**
+   * When provided, the timeout becomes an idle deadline: every matching message restarts the
+   * window, so the wait only fails after that long with no activity at all.
+   */
+  refreshDeadlineOn?: (msg: SessionOutboundMessage) => boolean;
 }
 
 interface CorrelatedResponseIdentity {
@@ -1286,13 +1298,18 @@ export class DaemonClient {
           });
         }),
         transport.onError((event) => {
-          this.resetConnectTimeout();
           const reason = describeTransportError(event);
           const isGeneric = reason === "Transport error";
           // Browser WebSocket.onerror often provides no useful details and is followed
           // by a close event (often with code 1006). Prefer surfacing the close details
           // instead of immediately disconnecting with a generic "Transport error".
           if (isGeneric) {
+            // Keep the connect deadline armed. This error is not a verdict, and
+            // an open arriving inside the 250ms window cancels the deferral
+            // below. Clearing the deadline here left a dial that erred and then
+            // opened without hello sitting in `connecting` with no timer at all
+            // — and `retryNow()`/`ensureConnected()` both decline to touch a
+            // client that is already `connecting`, so nothing ever redialled.
             this.lastErrorValue ??= reason;
             if (!this.pendingGenericTransportErrorTimeout) {
               this.pendingGenericTransportErrorTimeout = setTimeout(() => {
@@ -1313,6 +1330,7 @@ export class DaemonClient {
             return;
           }
 
+          this.resetConnectTimeout();
           if (this.pendingGenericTransportErrorTimeout) {
             clearTimeout(this.pendingGenericTransportErrorTimeout);
             this.pendingGenericTransportErrorTimeout = null;
@@ -1676,6 +1694,8 @@ export class DaemonClient {
     timeout?: number;
     select: (msg: SessionOutboundMessage) => T | null;
     options?: { skipQueue?: boolean };
+    /** Turns `timeout` into an idle deadline refreshed by every matching message. */
+    refreshDeadlineOn?: (msg: SessionOutboundMessage) => boolean;
   }): Promise<T> {
     const timeout = params.timeout ?? DEFAULT_SESSION_RPC_TIMEOUT_MS;
     const { promise, cancel } = this.waitForWithCancel<RpcWaitResult<T>>(
@@ -1698,7 +1718,11 @@ export class DaemonClient {
         return { kind: "ok", value };
       },
       timeout,
-      { ...params.options, requestId: params.requestId },
+      {
+        ...params.options,
+        requestId: params.requestId,
+        ...(params.refreshDeadlineOn ? { refreshDeadlineOn: params.refreshDeadlineOn } : {}),
+      },
     );
 
     try {
@@ -1726,6 +1750,7 @@ export class DaemonClient {
     timeout?: number;
     responseType: TResponseType;
     options?: { skipQueue?: boolean };
+    refreshDeadlineOn?: (msg: SessionOutboundMessage) => boolean;
     selectPayload?: (payload: CorrelatedResponsePayload<TResponseType>) => TResult | null;
   }): Promise<TResult> {
     return this.sendRequest({
@@ -1733,6 +1758,7 @@ export class DaemonClient {
       message: params.message,
       timeout: params.timeout,
       options: params.options,
+      ...(params.refreshDeadlineOn ? { refreshDeadlineOn: params.refreshDeadlineOn } : {}),
       select: (msg) => {
         const correlated = msg as CorrelatedResponseMessage;
         if (correlated.type !== params.responseType) {
@@ -1758,6 +1784,7 @@ export class DaemonClient {
     message: { type: SessionInboundMessage["type"] } & Record<string, unknown>;
     responseType: TResponseType;
     timeout?: number;
+    refreshDeadlineOn?: (msg: SessionOutboundMessage) => boolean;
     selectPayload?: (payload: CorrelatedResponsePayload<TResponseType>) => TResult | null;
   }): Promise<TResult> {
     const resolvedRequestId = this.createRequestId(params.requestId);
@@ -1771,6 +1798,7 @@ export class DaemonClient {
       responseType: params.responseType,
       timeout: params.timeout,
       options: { skipQueue: true },
+      ...(params.refreshDeadlineOn ? { refreshDeadlineOn: params.refreshDeadlineOn } : {}),
       ...(params.selectPayload ? { selectPayload: params.selectPayload } : {}),
     });
   }
@@ -1785,6 +1813,7 @@ export class DaemonClient {
       unknown
     >;
     timeout?: number;
+    refreshDeadlineOn?: (msg: SessionOutboundMessage) => boolean;
     selectPayload?: (payload: CorrelatedResponsePayload<TResponseType>) => TResult | null;
   }): Promise<TResult> {
     const responseType = params.message.type.replace(/\.request$/, ".response") as TResponseType;
@@ -2291,6 +2320,7 @@ export class DaemonClient {
     input: { repo: string; targetDirectory: string; cloneProtocol?: ProjectGithubCloneProtocol },
     requestId?: string,
   ): Promise<ProjectGithubClonePayload> {
+    const resolvedRequestId = this.createRequestId(requestId);
     const message = {
       type: "project.github.clone.request",
       repo: input.repo,
@@ -2298,9 +2328,11 @@ export class DaemonClient {
       ...(input.cloneProtocol ? { cloneProtocol: input.cloneProtocol } : {}),
     } as const;
     return this.sendNamespacedCorrelatedSessionRequest<"project.github.clone.response">({
-      requestId,
+      requestId: resolvedRequestId,
       message,
-      timeout: PROJECT_GITHUB_CLONE_TIMEOUT_MS,
+      timeout: PROJECT_GITHUB_CLONE_IDLE_TIMEOUT_MS,
+      refreshDeadlineOn: (msg) =>
+        msg.type === "project.github.clone.progress" && msg.payload.requestId === resolvedRequestId,
     });
   }
 
@@ -2996,6 +3028,41 @@ export class DaemonClient {
         return response.payload.requestId === requestId ? response.payload : null;
       },
     });
+  }
+
+  async subscribeAndFetchAgentTimeline(
+    agentIds: string[],
+    agentId: string,
+    options: FetchAgentTimelineOptions = {},
+  ): Promise<FetchAgentTimelinePayload> {
+    const requestId = this.createRequestId(options.requestId);
+    const normalizedAgentIds = [...new Set(agentIds)].sort();
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.timeline.subscribe_and_fetch.request",
+      agentIds: normalizedAgentIds,
+      fetch: {
+        agentId,
+        ...(options.direction ? { direction: options.direction } : {}),
+        ...(options.cursor ? { cursor: options.cursor } : {}),
+        ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
+        ...(options.projection ? { projection: options.projection } : {}),
+        ...(options.mergeWindow === true ? { mergeWindow: true } : {}),
+      },
+      requestId,
+    });
+    const payload = await this.sendRequest({
+      requestId,
+      message,
+      timeout: options.timeout,
+      options: { skipQueue: true },
+      select: (response) =>
+        response.type === "agent.timeline.subscribe_and_fetch.response" &&
+        response.payload.requestId === requestId
+          ? response.payload
+          : null,
+    });
+    if (payload.timeline.error) throw new Error(payload.timeline.error);
+    return payload.timeline;
   }
 
   async buildAgentForkContext(
@@ -5939,15 +6006,45 @@ export class DaemonClient {
     this.config = { ...this.config, reconnect: { ...this.config.reconnect, enabled } };
   }
 
+  /**
+   * Collapse the reconnect backoff and try again now.
+   *
+   * The backoff exists for a host that keeps refusing, where hammering it is
+   * pointless. It is the wrong answer when something just told us the world
+   * changed — the app came back to the foreground, a push arrived, the network
+   * flipped. In those cases the pending timer is pure latency, and on a peer
+   * transport it can be the difference between a connection that is ready when
+   * the user finishes opening the app and one that waits out 30 seconds.
+   *
+   * A no-op unless we are disconnected and waiting on a timer.
+   */
+  retryNow(): void {
+    if (this.connectionState.status !== "disconnected") return;
+    if (!this.shouldReconnect || this.config.reconnect?.enabled === false) return;
+    this.reconnectAttempt = 0;
+    this.cancelReconnectTimer();
+    this.attemptConnect();
+  }
+
+  /**
+   * Drop any pending backoff timer.
+   *
+   * Every caller that changes where the connection is headed has to do this,
+   * because a live timer calls `attemptConnect()` unconditionally and that
+   * disposes whatever transport is current.
+   */
+  private cancelReconnectTimer(): void {
+    if (!this.reconnectTimeout) return;
+    clearTimeout(this.reconnectTimeout);
+    this.reconnectTimeout = null;
+  }
+
   private scheduleReconnect(input?: {
     reason?: string;
     event?: string;
     reasonCode?: string;
   }): void {
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
-    }
+    this.cancelReconnectTimer();
     const wasDisposed = this.connectionState.status === "disposed";
     const reason = input?.reason;
 
@@ -6061,6 +6158,12 @@ export class DaemonClient {
         this.lastServerInfoMessage = serverInfo;
         if (this.connectionState.status === "connecting") {
           this.resetConnectTimeout();
+          // A backoff timer armed before this connection succeeded is now a
+          // scheduled self-disconnect: when it fires, attemptConnect() disposes
+          // the transport it is standing on and redials. Measured on device as a
+          // connection that died ~50ms after hello and returned one base delay
+          // later.
+          this.cancelReconnectTimer();
           this.reconnectAttempt = 0;
           this.updateConnectionState({ status: "connected" }, { event: "HELLO_SERVER_INFO" });
           this.startLivenessHeartbeat();
@@ -6117,13 +6220,17 @@ export class DaemonClient {
   private resolveWaiters(msg: SessionOutboundMessage): void {
     for (const waiter of Array.from(this.waiters)) {
       const result = waiter.predicate(msg);
-      if (result !== null) {
-        this.waiters.delete(waiter);
-        if (waiter.timeoutHandle) {
-          clearTimeout(waiter.timeoutHandle);
+      if (result === null) {
+        if (waiter.refreshDeadlineOn?.(msg)) {
+          waiter.refreshDeadline?.();
         }
-        waiter.resolve(result);
+        continue;
       }
+      this.waiters.delete(waiter);
+      if (waiter.timeoutHandle) {
+        clearTimeout(waiter.timeoutHandle);
+      }
+      waiter.resolve(result);
     }
   }
 
@@ -6214,7 +6321,11 @@ export class DaemonClient {
     options?: WaitOptions,
   ): WaitHandle<T> {
     // Capture stack trace at call site, not inside setTimeout
-    const timeoutError = new Error(`Timeout waiting for message (${timeout}ms)`);
+    const timeoutError = new Error(
+      options?.refreshDeadlineOn
+        ? `Timeout waiting for message (no activity for ${timeout}ms)`
+        : `Timeout waiting for message (${timeout}ms)`,
+    );
 
     let waiter: Waiter<T> | null = null;
     let settled = false;
@@ -6233,23 +6344,30 @@ export class DaemonClient {
       };
       rejectFn = wrappedReject;
 
-      const timeoutHandle =
-        timeout > 0
-          ? setTimeout(() => {
-              if (waiter) {
-                this.waiters.delete(waiter);
-              }
-              wrappedReject(timeoutError);
-            }, timeout)
-          : null;
+      const armTimeout = () =>
+        setTimeout(() => {
+          if (waiter) {
+            this.waiters.delete(waiter);
+          }
+          wrappedReject(timeoutError);
+        }, timeout);
 
       waiter = {
         predicate,
         resolve: wrappedResolve,
         reject: wrappedReject,
-        timeoutHandle,
+        timeoutHandle: timeout > 0 ? armTimeout() : null,
         requestId: options?.requestId,
+        ...(options?.refreshDeadlineOn ? { refreshDeadlineOn: options.refreshDeadlineOn } : {}),
       };
+      if (timeout > 0 && options?.refreshDeadlineOn) {
+        const armed = waiter;
+        armed.refreshDeadline = () => {
+          if (settled || !armed.timeoutHandle) return;
+          clearTimeout(armed.timeoutHandle);
+          armed.timeoutHandle = armTimeout();
+        };
+      }
       this.waiters.add(waiter);
     });
 

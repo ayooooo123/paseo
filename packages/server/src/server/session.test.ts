@@ -5062,6 +5062,87 @@ test("replaces a capable session's complete viewed timeline set", async () => {
   ]);
 });
 
+test("acknowledges subscription and focused timeline from one request", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({ messages });
+  session.updateClientCapabilities({ selective_agent_timeline: true });
+
+  await session.handleMessage({
+    type: "agent.timeline.subscribe_and_fetch.request",
+    agentIds: ["agent-b", "agent-a", "agent-a"],
+    fetch: { agentId: "agent-a", direction: "tail" },
+    requestId: "timeline-bootstrap-1",
+  });
+
+  expect(messages).toHaveLength(1);
+  expect(messages[0]).toMatchObject({
+    type: "agent.timeline.subscribe_and_fetch.response",
+    payload: {
+      agentIds: ["agent-a", "agent-b"],
+      requestId: "timeline-bootstrap-1",
+      timeline: {
+        requestId: "timeline-bootstrap-1",
+        agentId: "agent-a",
+        direction: "tail",
+      },
+    },
+  });
+});
+
+test("installs a combined timeline subscription before its snapshot completes", async () => {
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const storageGate = deferred<undefined>();
+  const storageGet = vi.fn(() => storageGate.promise);
+  const session = createSessionForTest({
+    targetedMessages,
+    agentStorage: { get: storageGet },
+    agentManager: {
+      getAgent: vi.fn(() => undefined),
+      waitForAgentClose: vi.fn(async () => undefined),
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  const capableSocket = {};
+  session.updateClientCapabilities({ selective_agent_timeline: true }, capableSocket);
+
+  const response = session.handleMessage(
+    {
+      type: "agent.timeline.subscribe_and_fetch.request",
+      agentIds: ["agent-a"],
+      fetch: { agentId: "agent-a", direction: "tail" },
+      requestId: "timeline-bootstrap-ordering",
+    },
+    capableSocket,
+  );
+  await vi.waitFor(() => expect(storageGet).toHaveBeenCalledWith("agent-a"));
+
+  const listener = agentEventListeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", messageId: "during-snapshot", text: "live" },
+    },
+  });
+
+  expect(targetedMessages).toHaveLength(1);
+  expect(targetedMessages[0]).toMatchObject({
+    source: capableSocket,
+    message: { type: "agent_stream", payload: { agentId: "agent-a" } },
+  });
+
+  storageGate.resolve(undefined);
+  await response;
+  expect(targetedMessages.at(-1)?.message.type).toBe("agent.timeline.subscribe_and_fetch.response");
+});
+
 test("acknowledges a timeline subscription only to its socket source", async () => {
   const messages: SessionOutboundMessage[] = [];
   const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];

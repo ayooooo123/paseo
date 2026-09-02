@@ -64,7 +64,10 @@ export function PairLinkModal({ visible, onClose, onCancel, onSaved }: PairLinkM
   const { theme } = useUnistyles();
   const { t } = useTranslation();
   const daemons = useHosts();
-  const { upsertConnectionFromOfferUrl: upsertDaemonFromOfferUrl } = useHostMutations();
+  const {
+    upsertConnectionFromOfferUrl: upsertDaemonFromOfferUrl,
+    upsertHyperdhtConnectionFromInvite,
+  } = useHostMutations();
   const isMobile = useIsCompactFormFactor();
 
   const offerUrlRef = useRef("");
@@ -101,6 +104,26 @@ export function PairLinkModal({ visible, onClose, onCancel, onSaved }: PairLinkM
     const raw = offerUrlRef.current.trim();
     if (!raw) {
       setErrorMessage(t("pairing.link.errors.required"));
+      return;
+    }
+    if (raw.startsWith("paseo-peer://v1/")) {
+      try {
+        setIsSaving(true);
+        setErrorMessage("");
+        const { profile, serverId, hostname } = await upsertHyperdhtConnectionFromInvite(raw);
+        const isNewHost = !daemons.some((daemon) => daemon.serverId === serverId);
+        onSaved?.({ profile, serverId, hostname, isNewHost });
+        handleClose();
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : t("pairing.link.errors.unableToPair");
+        setErrorMessage(message);
+        if (!isMobile) {
+          Alert.alert(t("pairing.link.alert.failedTitle"), message);
+        }
+      } finally {
+        setIsSaving(false);
+      }
       return;
     }
     if (!raw.includes("#offer=")) {
@@ -161,7 +184,16 @@ export function PairLinkModal({ visible, onClose, onCancel, onSaved }: PairLinkM
     } finally {
       setIsSaving(false);
     }
-  }, [daemons, handleClose, isMobile, isSaving, onSaved, t, upsertDaemonFromOfferUrl]);
+  }, [
+    daemons,
+    handleClose,
+    isMobile,
+    isSaving,
+    onSaved,
+    t,
+    upsertDaemonFromOfferUrl,
+    upsertHyperdhtConnectionFromInvite,
+  ]);
 
   const handleChangeOfferUrl = useCallback((next: string) => {
     offerUrlRef.current = next;

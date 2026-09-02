@@ -20,6 +20,8 @@ import {
   buildAddProjectMethods,
   buildCloneLocationOptions,
   buildManualGithubRepositoryChoices,
+  cloneProgressText,
+  CLONE_STARTING_TEXT,
 } from "./options";
 
 const HOST: AddProjectHost = {
@@ -204,5 +206,55 @@ describe("Add Project options", () => {
         disabled: false,
       },
     ]);
+  });
+});
+
+describe("clone progress text", () => {
+  it("renders phase, percent and git's own detail", () => {
+    expect(
+      cloneProgressText({
+        requestId: "req-1",
+        repo: "fast4x/RiPlay",
+        phase: "receiving",
+        percent: 42,
+        detail: "245.55 MiB | 2.10 MiB/s",
+      }),
+    ).toBe("Receiving objects 42% · 245.55 MiB | 2.10 MiB/s");
+  });
+
+  it("omits the percent for phases git does not quantify", () => {
+    expect(
+      cloneProgressText({
+        requestId: "req-1",
+        repo: "fast4x/RiPlay",
+        phase: "resolving",
+        percent: null,
+        detail: null,
+      }),
+    ).toBe("Resolving deltas");
+  });
+
+  it("shows the static clone text for the starting phase", () => {
+    expect(
+      cloneProgressText({
+        requestId: "req-1",
+        repo: "fast4x/RiPlay",
+        phase: "starting",
+        percent: null,
+        detail: null,
+      }),
+    ).toBe(CLONE_STARTING_TEXT);
+  });
+
+  it("rounds fractional percents", () => {
+    expect(
+      cloneProgressText({
+        requestId: "req-1",
+        repo: "fast4x/RiPlay",
+        phase: "checkout",
+        percent: 62.4,
+        detail: "1234/1987",
+      }),
+    ).toBe("Checking out files 62% · 1234/1987");
   });
 });

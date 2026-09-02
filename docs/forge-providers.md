@@ -192,6 +192,12 @@ are stale, run `npm run build:server`.
 
 - GitHub is a normal registry entry plus released compatibility shims. Keep all
   real shims tagged with `COMPAT(name)`.
+- Repository search for cloning must list the user's own repositories and filter
+  locally. GitHub's repo-search index excludes forks unless the query opts them
+  in, and never contains private repositories, so `gh search repos` cannot find
+  a repo the user owns — `--owner=@me` does not fix it. `gh repo list` sees all
+  of them but has no server-side query. Expect the same split on other forges
+  and reach for global search only after the user's own results fall short.
 - Gitea-family facts use `forgeSpecific.forge === "gitea"` even when the
   top-level brand is Forgejo or Codeberg.
 - Gitea's legacy Actions task endpoint cannot filter by commit, may enforce a

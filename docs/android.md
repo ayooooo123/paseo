@@ -80,6 +80,33 @@ This keeps the `sh.paseo` package id, release Hermes bundle, and release optimiz
 and daemon WebSocket traffic. The markers contain message types and sizes, never payload contents,
 and emit only while a system trace records the `sh.paseo` app (`perfetto -a sh.paseo ...`).
 
+### Bare worker native addons
+
+The HyperDHT peer transport runs in a Bare worklet, and its module graph pulls in native addons —
+`udx-native`, `sodium-native`, and the `bare-*` runtime addons. `scripts/build-dht-worker.mjs` packs
+the worker with `bare-pack --linked`, which emits _references_ to those addons instead of embedding
+them. The packed source is a lazy `dht-worker.bundle.js` module; keep it outside a generated
+TypeScript base64 literal so app startup does not parse, decode, and copy the worker before a DHT
+dial needs it. The app has to ship the matching `.so` per ABI or the worklet throws `ADDON_NOT_FOUND` at
+`import hyperdht` — and an uncaught throw on the worklet thread aborts the whole app process, not
+just the connection.
+
+`plugins/with-bare-addons.js` runs `bare-link` during prebuild and writes `lib<name>.<version>.so`
+into `android/app/src/main/jniLibs/<abi>/`. It is a config plugin rather than a build script because
+`expo prebuild --clean` regenerates `android/`; anything staged earlier is deleted. `android/` is
+gitignored, so EAS prebuilds too and gets the same step for free.
+
+The plugin resolves the installed `bare-link` through `require.resolve` instead of `npx`. On a cold
+builder `npx` will fetch from the registry, and a linker version that disagrees with the packed
+bundle produces addons the worker cannot load.
+
+The desktop-managed daemon sets `PASEO_DHT_ENABLED=true` itself. Do not rely on a shell or launch
+agent to provide it: Electron does not inherit that environment, and replacing the launch-agent
+daemon with a desktop-managed daemon would leave mobile clients dialing a peer that no longer
+listens. On mobile backgrounding, report the destroyed stream as closed before parking the DHT
+node. That puts the client into reconnect state while preserving the node's routing table for the
+foreground redial.
+
 Or from `packages/app`:
 
 ```bash

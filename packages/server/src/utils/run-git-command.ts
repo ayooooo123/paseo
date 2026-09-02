@@ -50,6 +50,21 @@ export interface GitCommandOptions {
   envOverlay?: ProcessEnvRecord;
   logger?: Pick<Logger, "trace">;
   timeout?: number;
+  /**
+   * Kill the process only after this long with no stdout or stderr output, and
+   * ignore `timeout`. Transfer commands like `clone` and `fetch` run for a time
+   * proportional to repository size and link speed, so a wall clock caps the
+   * repository you are allowed to have rather than detecting a hang. Pair with
+   * `--progress` so git keeps emitting while it works.
+   */
+  idleTimeout?: number;
+  /**
+   * Streaming seam for progress-emitting commands: called with the decoded text
+   * of every stderr chunk, including chunks arriving after the retained stderr
+   * budget is full, so a `--progress` transfer can be reported live. A throwing
+   * callback is swallowed and never fails the command.
+   */
+  onOutput?: (text: string) => void;
   maxOutputBytes?: number;
   acceptExitCodes?: number[];
 }
@@ -280,7 +295,8 @@ function runGitCommandWithProvenance(
         pending: gitProcessScheduler.pendingCount,
       });
       gitRuntimeMetrics.start(runtimeMetric);
-      const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
+      const idleTimeout = options.idleTimeout;
+      const timeout = idleTimeout ?? options.timeout ?? DEFAULT_TIMEOUT_MS;
       const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
       const acceptExitCodes = options.acceptExitCodes ?? [0];
       const command = formatGitCommand(args);
@@ -295,6 +311,7 @@ function runGitCommandWithProvenance(
             cwd: options.cwd,
             cwdExists: existsSync(options.cwd),
             timeout,
+            idleTimeout,
             maxOutputBytes,
             acceptExitCodes,
             envOverlayKeys: getEnvOverlayKeys(envOverlay),
@@ -397,16 +414,54 @@ function runGitCommandWithProvenance(
         return;
       }
 
-      timer = setTimeout(() => {
-        timeoutError = new Error(`Git command timed out after ${timeout}ms: ${command}`);
+      // One watchdog rather than a timer per output chunk: git writes progress
+      // many times a second, and `observeOutput` only stamps a clock. When the
+      // deadline fires early because output arrived, it re-arms for the remainder.
+      let lastOutputAt = Date.now();
+      const onDeadline = () => {
+        if (idleTimeout !== undefined) {
+          const idleFor = Date.now() - lastOutputAt;
+          if (idleFor < idleTimeout) {
+            timer = setTimeout(onDeadline, idleTimeout - idleFor);
+            return;
+          }
+        }
+        timeoutError = new Error(
+          idleTimeout === undefined
+            ? `Git command timed out after ${timeout}ms: ${command}`
+            : `Git command produced no output for ${idleTimeout}ms: ${command}`,
+        );
         child.kill("SIGKILL");
         settle(() => reject(timeoutError));
         if (processExit) {
           settleTimeoutTrace(processExit.exitCode, processExit.signal);
         }
-      }, timeout);
+      };
+      const observeOutput = () => {
+        lastOutputAt = Date.now();
+      };
+      timer = setTimeout(onDeadline, timeout);
+
+      const onOutput = options.onOutput;
+      /** Feeds the streaming seam without ever letting its consumer break the command. */
+      const reportOutput =
+        onOutput === undefined
+          ? () => {}
+          : (chunk: Buffer | string) => {
+              try {
+                onOutput(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+              } catch (error) {
+                if (logger && traceContext) {
+                  logger.trace(
+                    { ...traceContext, err: error },
+                    "Git command output observer threw",
+                  );
+                }
+              }
+            };
 
       stdout.on("data", (chunk: Buffer | string) => {
+        observeOutput();
         if (settled || truncated) return;
 
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -431,6 +486,13 @@ function runGitCommandWithProvenance(
       });
 
       stderr.on("data", (chunk: Buffer | string) => {
+        // Progress lands here, so rearm before the recording caps below: git keeps
+        // writing progress long after the retained 2 KiB is full, and a stalled
+        // transfer is the only thing the deadline should catch.
+        observeOutput();
+        // Same reason the rearm sits above the caps: the consumer wants every
+        // update, not just the ones that fit in the retained buffer.
+        reportOutput(chunk);
         if (settled || stderrBytes >= DEFAULT_STDERR_LIMIT) return;
 
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);

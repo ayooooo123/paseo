@@ -352,6 +352,11 @@ export interface CachedTimeline {
   hasOlder: boolean;
 }
 
+export interface CachedChatSnapshot {
+  agent?: Agent;
+  timeline?: CachedTimeline;
+}
+
 function deserializeTimeline(stored: StoredTimeline | null): CachedTimeline | null {
   if (!stored) {
     return null;
@@ -913,6 +918,29 @@ export class ReplicaCache {
       await this.deleteInvalidRow(row);
       return undefined;
     }
+  }
+
+  async readChatSnapshot(serverId: string, agentId: string): Promise<CachedChatSnapshot> {
+    const rows = await this.readRows(serverId, ["agent", "timeline"], [agentId]);
+    const snapshot: CachedChatSnapshot = {};
+    for (const row of rows) {
+      try {
+        if (row.kind === "agent") {
+          const stored = parseStoredPayload(StoredAgentSchema, row.payload);
+          if (stored.snapshot.id !== row.id) throw new Error("Replica agent row id mismatch");
+          snapshot.agent = deserializeAgent(serverId, stored);
+          continue;
+        }
+        if (row.kind === "timeline") {
+          const stored = parseStoredPayload(StoredTimelineSchema, row.payload);
+          if (stored.agentId !== agentId) throw new Error("Replica timeline row id mismatch");
+          snapshot.timeline = deserializeTimeline(stored) ?? undefined;
+        }
+      } catch {
+        await this.deleteInvalidRow(row);
+      }
+    }
+    return snapshot;
   }
 
   private async readRows(

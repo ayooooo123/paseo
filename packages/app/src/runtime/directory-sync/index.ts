@@ -325,8 +325,16 @@ export class DirectorySync {
     this.agents.commitCachedAgent(token, agent);
   }
 
-  async prepareAgentRoute(agentId: string): Promise<void> {
-    await this.loadCachedAgent(agentId);
+  async prepareAgentRoute(agentId: string, cachedAgent?: Agent): Promise<void> {
+    if (cachedAgent) {
+      const session = useSessionStore.getState().sessions[this.serverId];
+      if (session && !session.agents.has(agentId)) {
+        const token = this.agents.captureCache(agentId);
+        this.agents.commitCachedAgent(token, cachedAgent);
+      }
+    } else {
+      await this.loadCachedAgent(agentId);
+    }
     const agent = useSessionStore.getState().sessions[this.serverId]?.agents.get(agentId);
     if (agent?.workspaceId) await this.loadCachedWorkspace(agent.workspaceId);
   }

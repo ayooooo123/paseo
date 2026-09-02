@@ -972,6 +972,14 @@ export interface SearchGitHubRepositoriesOptions {
   limit?: number;
 }
 
+/**
+ * How many of your own repositories to pull before filtering locally.
+ * `gh repo list` has no server-side query, so the filter is client-side and this
+ * is the ceiling on what can be found. Generous on purpose: a repo you own and
+ * cannot find is the failure being fixed.
+ */
+const OWNED_REPOSITORY_SCAN_LIMIT = 300;
+
 export interface GitHubService extends ForgeService {
   searchRepositories(options: SearchGitHubRepositoriesOptions): Promise<GitHubRepositorySummary[]>;
 }
@@ -2324,44 +2332,77 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     async searchRepositories(input) {
       const limit = input.limit ?? 20;
       const query = input.query.trim();
-      if (query.length === 0) {
-        const [stdout, cloneProtocol] = await Promise.all([
-          run(
-            [
-              "repo",
-              "list",
-              "--json",
-              "id,name,nameWithOwner,description,isPrivate,updatedAt,sshUrl,url",
-              "--limit",
-              String(limit),
-            ],
-            { cwd: input.cwd },
-          ),
-          resolveConfiguredCloneProtocol(input.cwd, run),
-        ]);
-        return parseRepositoryList(stdout, cloneProtocol);
-      }
 
-      const [stdout, cloneProtocol] = await Promise.all([
+      // Your own repositories, always. `gh repo list` is the only source that
+      // sees all of them: GitHub's repo-search index excludes forks unless the
+      // query says otherwise, and it cannot see private repositories at all, so
+      // even `gh search repos --owner=@me` misses both. Searching for a repo you
+      // own and being shown someone else's is the bug this avoids.
+      //
+      // `gh repo list` has no server-side query, so a query means fetching wide
+      // and filtering here. With no query there is nothing to filter and the
+      // display limit is the fetch limit.
+      const scanLimit = query.length === 0 ? limit : OWNED_REPOSITORY_SCAN_LIMIT;
+      const [ownedStdout, cloneProtocol] = await Promise.all([
         run(
           [
-            "search",
-            "repos",
-            query,
+            "repo",
+            "list",
             "--json",
-            "id,name,fullName,description,isPrivate,updatedAt,url",
-            "--sort",
-            "updated",
-            "--order",
-            "desc",
+            "id,name,nameWithOwner,description,isPrivate,updatedAt,sshUrl,url",
             "--limit",
-            String(limit),
+            String(scanLimit),
           ],
           { cwd: input.cwd },
         ),
         resolveConfiguredCloneProtocol(input.cwd, run),
       ]);
-      return parseRepositorySearch(stdout, cloneProtocol);
+      const owned = parseRepositoryList(ownedStdout, cloneProtocol);
+
+      if (query.length === 0) return owned;
+
+      const needle = query.toLowerCase();
+      const matches = owned.filter(
+        (repository) =>
+          repository.nameWithOwner.toLowerCase().includes(needle) ||
+          (repository.description ?? "").toLowerCase().includes(needle),
+      );
+      if (matches.length >= limit) return matches.slice(0, limit);
+
+      // Only once your own repositories are exhausted is the rest of GitHub
+      // worth showing — cloning someone else's repository is still a real thing
+      // to want, it just never belongs ahead of your own. A failure here is not
+      // worth losing the matches already in hand.
+      let globalMatches: GitHubRepositorySummary[] = [];
+      try {
+        globalMatches = parseRepositorySearch(
+          await run(
+            [
+              "search",
+              "repos",
+              query,
+              "--json",
+              "id,name,fullName,description,isPrivate,updatedAt,url",
+              "--sort",
+              "updated",
+              "--order",
+              "desc",
+              "--limit",
+              String(limit - matches.length),
+            ],
+            { cwd: input.cwd },
+          ),
+          cloneProtocol,
+        );
+      } catch {
+        globalMatches = [];
+      }
+
+      const seen = new Set(matches.map((repository) => repository.nameWithOwner));
+      return [
+        ...matches,
+        ...globalMatches.filter((repository) => !seen.has(repository.nameWithOwner)),
+      ].slice(0, limit);
     },
 
     async searchIssuesAndPrs(input) {

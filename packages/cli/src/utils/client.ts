@@ -11,6 +11,8 @@ import {
   parseConnectionOfferFromUrl,
   type ConnectionOffer,
 } from "@getpaseo/protocol/connection-offer";
+import { DHT_INVITE_PREFIX } from "@getpaseo/protocol/dht-peer";
+import { createDhtTransportFactory } from "@getpaseo/client/internal/dht-transport";
 import { parseSshTransportUri } from "@getpaseo/protocol/ssh-transport";
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
 import path from "node:path";
@@ -355,12 +357,49 @@ function parseHostOfferOrNull(host: string | undefined): ConnectionOffer | null 
   }
 }
 
+async function connectViaPeerInvite(
+  invite: string,
+  clientId: string,
+  timeout: number,
+): Promise<DaemonClient> {
+  const client = new DaemonClient({
+    url: "ws://hyperdht.invalid/ws",
+    clientId,
+    clientType: "cli",
+    appVersion: resolveCliVersion(),
+    connectTimeoutMs: timeout,
+    transportFactory: createDhtTransportFactory({
+      invite,
+      ...(() => {
+        const bs = (process.env.PASEO_DHT_BOOTSTRAP ?? "")
+          .split(",")
+          .map((e) => e.trim())
+          .filter((e) => e.length > 0);
+        return bs.length > 0 ? { bootstrap: bs } : {};
+      })(),
+    }),
+    reconnect: { enabled: false },
+  });
+  try {
+    await client.connect();
+    return client;
+  } catch (error) {
+    await client.close().catch(() => {});
+    const message = error instanceof Error ? error.message : String(error);
+    const lastError = client.lastError ? ` (${client.lastError})` : "";
+    throw new Error(`Failed to connect via peer invite: ${message}${lastError}`, { cause: error });
+  }
+}
+
 export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonClient> {
   const timeout = options?.timeout ?? DEFAULT_TIMEOUT;
   const clientId = await getOrCreateCliClientId();
   const nodeWebSocketFactory = createNodeWebSocketFactory();
 
   const explicitHost = options?.host ?? process.env.PASEO_HOST;
+  if (explicitHost?.startsWith(DHT_INVITE_PREFIX)) {
+    return connectViaPeerInvite(explicitHost, clientId, timeout);
+  }
   if (explicitHost?.trim().startsWith("ssh://")) {
     const target = parseSshTransportUri(explicitHost.trim());
     const tunnel = await createSshTunnel(target);

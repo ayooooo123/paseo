@@ -115,6 +115,24 @@ export function createWorkspaceProvisioningService(deps: {
       };
     }
 
+    // Reuse an existing non-archived workspace for this checkout instead of
+    // minting a duplicate. Imports for the same directory (e.g. repeated OMP
+    // session syncs) must land in one workspace, matching the
+    // project -> workspace -> agents grouping the app renders. Only the
+    // interactive "create workspace" path (which does not flow through here)
+    // is expected to mint fresh workspaces.
+    const existingWorkspaces = await workspaceRegistry.list();
+    const reusableWorkspace = existingWorkspaces.find(
+      (candidate) =>
+        !candidate.archivedAt && createRealpathAwarePathMatcher(candidate.cwd)(input.cwd),
+    );
+    if (reusableWorkspace) {
+      return {
+        value: await operation(reusableWorkspace),
+        createdWorkspace: null,
+      };
+    }
+
     const projectsBeforeImport = await projectRegistry.list();
     const workspace = await createWorkspaceForDirectory(input.cwd);
     const previousProject =

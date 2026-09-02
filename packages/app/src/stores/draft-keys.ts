@@ -7,6 +7,16 @@ export function generateDraftId(): string {
   return `draft_${generateMessageId()}`;
 }
 
+/**
+ * A draft chat has no agent on the daemon yet — the id is a local placeholder
+ * until the first message creates one. Anything that would ask the daemon about
+ * an agent has to check this first, or the daemon answers "Agent not found" for
+ * a request that could never have succeeded.
+ */
+export function isDraftAgentId(agentId: string): boolean {
+  return agentId.startsWith("draft_");
+}
+
 export function buildNewWorkspaceDraftKey(draftId?: string): string {
   const explicitDraftId = draftId?.trim();
   if (explicitDraftId) {

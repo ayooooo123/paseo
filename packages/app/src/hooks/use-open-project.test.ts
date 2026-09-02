@@ -51,12 +51,15 @@ function createFakeSession() {
 
 function createFakeGithubCloneClient(project: ReturnType<typeof buildProjectPayload> | null) {
   const clones: RecordedClone[] = [];
+  const requestIds: (string | undefined)[] = [];
   return {
     clones,
-    cloneGithubProject: async (input: RecordedClone) => {
+    requestIds,
+    cloneGithubProject: async (input: RecordedClone, requestId?: string) => {
       clones.push(input);
+      requestIds.push(requestId);
       return {
-        requestId: "request-3",
+        requestId: requestId ?? "request-3",
         repo: "owner/project",
         checkoutPath: PROJECT_PATH,
         error: project ? null : "Project registration failed",
@@ -223,6 +226,24 @@ describe("cloneGithubProjectDirectly", () => {
     });
     expect(session.projects).toEqual([]);
     expect(session.hydrated).toEqual([]);
+  });
+
+  it("forwards the caller's request id so clone progress can be correlated", async () => {
+    const session = createFakeSession();
+    const github = createFakeGithubCloneClient(buildProjectPayload());
+
+    await cloneGithubProjectDirectly({
+      serverId: SERVER_ID,
+      repo: "owner/project",
+      targetDirectory: "~/workspace",
+      requestId: "add-project-clone-42",
+      isConnected: true,
+      client: github,
+      upsertProject: session.upsertProject,
+      setHasHydratedWorkspaces: session.setHasHydratedWorkspaces,
+    });
+
+    expect(github.requestIds).toEqual(["add-project-clone-42"]);
   });
 });
 
