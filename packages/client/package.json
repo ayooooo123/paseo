@@ -21,6 +21,10 @@
       "types": "./dist/daemon-client-transport-types.d.ts",
       "default": "./dist/daemon-client-transport-types.js"
     },
+    "./internal/daemon-client-transport-utils": {
+      "types": "./dist/daemon-client-transport-utils.d.ts",
+      "default": "./dist/daemon-client-transport-utils.js"
+    },
     "./internal/daemon-client-websocket-transport": {
       "types": "./dist/daemon-client-websocket-transport.d.ts",
       "default": "./dist/daemon-client-websocket-transport.js"

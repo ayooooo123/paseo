@@ -1,5 +1,8 @@
 # Timeline sync
 
+For the proposed durable history and peer replication work, see the
+[Holepunch integration plan](refactors/holepunch-sync-plan.md). The behavior below describes the current implementation.
+
 Agent chat delivery has two paths:
 
 1. **Live stream** — `agent_stream` WebSocket messages for immediacy. These may be delta-shaped lifecycle updates.

@@ -14,13 +14,15 @@ declare module "hyperdht" {
   }
   export interface HyperDhtOptions {
     readonly bootstrap?: readonly string[];
+    readonly keyPair?: HyperDhtKeyPair;
+    readonly seed?: Buffer | Uint8Array;
   }
   export default class HyperDHT {
     constructor(options?: HyperDhtOptions);
     static keyPair(seed?: Buffer | Uint8Array): HyperDhtKeyPair;
     connect(
       publicKey: Buffer | Uint8Array,
-      options?: { keyPair?: HyperDhtKeyPair },
+      options?: { keyPair?: HyperDhtKeyPair; reusableSocket?: boolean },
     ): HyperDhtStream;
     destroy(): Promise<void>;
   }

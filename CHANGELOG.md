@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Reuse Node peer connections' DHT node and device identity across reconnects.
+- Cancel stale mobile peer dials, including network changes during resume, and reject queued frames from replaced connections.
+- Recover through a ready alternate host route without waiting for unrelated probes.
+- Separate dial and hello deadlines while preserving custom total connection budgets when no hello cap is set.
+- Keep binary peer frames within their payload bounds instead of exposing pooled backing bytes.
+- Reject pending connection attempts when the client closes.
+- Continue DHT cleanup after individual native close failures.
+
 ## 0.7.2 - 2026-09-02
 
 ### Added

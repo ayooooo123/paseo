@@ -323,6 +323,8 @@ export interface DaemonClientConfig {
   webSocketFactory?: WebSocketFactory;
   logger?: Logger;
   connectTimeoutMs?: number;
+  /** Maximum hello wait after transport-open, within the total connect budget. */
+  helloTimeoutMs?: number;
   e2ee?: {
     enabled?: boolean;
     daemonPublicKeyB64?: string;
@@ -1087,10 +1089,14 @@ export class DaemonClient {
   private connectionListeners: Set<(status: ConnectionState) => void> = new Set();
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private connectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private connectionAttemptId = 0;
+  private connectionStartedAt = 0;
+  private transportOpenedAt: number | null = null;
   private pendingGenericTransportErrorTimeout: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private shouldReconnect = true;
   private connectPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   private connectResolve: (() => void) | null = null;
   private connectReject: ((error: Error) => void) | null = null;
   private lastErrorValue: string | null = null;
@@ -1249,6 +1255,10 @@ export class DaemonClient {
       });
       this.transport = transport;
       this.lastServerInfoMessage = null;
+      this.connectionAttemptId += 1;
+      this.connectionStartedAt = perfNow();
+      this.transportOpenedAt = null;
+      this.traceConnectionStage("dial");
 
       this.updateConnectionState(
         {
@@ -1257,23 +1267,30 @@ export class DaemonClient {
         },
         { event: "CONNECT_REQUEST" },
       );
-      this.resetConnectTimeout();
       const timeoutMs = Math.max(1, this.config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
-      this.connectTimeout = setTimeout(() => {
-        if (this.connectionState.status !== "connecting") {
-          return;
-        }
-        this.lastErrorValue = "Connection timed out";
-        this.disposeTransport(1001, "Connection timed out");
-        this.scheduleReconnect({
-          reason: "Connection timed out",
-          event: "CONNECT_TIMEOUT",
-          reasonCode: "connect_timeout",
-        });
-      }, timeoutMs);
+      this.armConnectTimeout(transport, "dial", timeoutMs);
 
       this.transportCleanup = [
         transport.onOpen(() => {
+          if (
+            this.transport !== transport ||
+            this.connectionState.status !== "connecting" ||
+            this.transportOpenedAt !== null
+          ) {
+            return;
+          }
+          const openedAt = perfNow();
+          const remainingMs = timeoutMs - (openedAt - this.connectionStartedAt);
+          if (remainingMs <= 0) {
+            this.armConnectTimeout(transport, "dial", 0);
+            return;
+          }
+          this.transportOpenedAt = openedAt;
+          this.traceConnectionStage("hello");
+          const helloTimeoutMs = this.config.helloTimeoutMs ?? remainingMs;
+          if (!this.armConnectTimeout(transport, "hello", Math.min(remainingMs, helloTimeoutMs))) {
+            return;
+          }
           if (this.pendingGenericTransportErrorTimeout) {
             clearTimeout(this.pendingGenericTransportErrorTimeout);
             this.pendingGenericTransportErrorTimeout = null;
@@ -1287,7 +1304,10 @@ export class DaemonClient {
             clearTimeout(this.pendingGenericTransportErrorTimeout);
             this.pendingGenericTransportErrorTimeout = null;
           }
-          const reason = describeTransportClose(event);
+          const reason =
+            event == null && this.lastErrorValue
+              ? this.lastErrorValue
+              : describeTransportClose(event);
           if (reason) {
             this.lastErrorValue = reason;
           }
@@ -1377,12 +1397,13 @@ export class DaemonClient {
 
   async close(): Promise<void> {
     if (this.connectionState.status === "disposed") {
-      return;
+      // Idempotent: a repeat or overlapping close returns the same in-flight
+      // release, so a caller that must free process resources waits for the
+      // factory dispose to finish instead of returning while the node is live.
+      return this.closePromise ?? undefined;
     }
     this.shouldReconnect = false;
-    this.connectPromise = null;
-    this.connectResolve = null;
-    this.connectReject = null;
+    this.rejectConnect(new Error("Daemon client closed"));
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -1401,10 +1422,28 @@ export class DaemonClient {
       this.runtimeMetrics?.flush({ final: true });
       this.runtimeMetrics = null;
     }
+    // Permanent close releases process/host-owned transport-factory resources
+    // (e.g. the shared HyperDHT node). Reconnect never disposes: the factory
+    // keeps its node across stream generations. Teardown errors must not
+    // reject close() — callers fire it without catching. Publish the promise
+    // before the disposed state, so a close() triggered from a state listener
+    // returns the same in-flight release.
+    const disposeFactory = (async (): Promise<void> => {
+      const transportFactory = this.config.transportFactory;
+      if (transportFactory?.dispose) {
+        try {
+          await transportFactory.dispose();
+        } catch (error) {
+          this.logger.warn({ error }, "transport_factory_dispose_failed");
+        }
+      }
+    })();
+    this.closePromise = disposeFactory;
     this.updateConnectionState(
       { status: "disposed" },
       { event: "DISPOSE", reason: "Client closed", reasonCode: "disposed" },
     );
+    await disposeFactory;
   }
 
   ensureConnected(): void {
@@ -1420,7 +1459,8 @@ export class DaemonClient {
     ) {
       return;
     }
-    void this.connect();
+    // Background callers observe failures through connection status.
+    void this.connect().catch(() => undefined);
   }
 
   getConnectionState(): ConnectionState {
@@ -1547,6 +1587,42 @@ export class DaemonClient {
   private traceInstant(name: string, args?: Record<string, string>): void {
     const isOpen = this.beginTraceSection(name, args);
     this.endTraceSection(isOpen);
+  }
+
+  private traceConnectionStage(
+    stage: "dial" | "hello" | "ready" | "dial_timeout" | "hello_timeout",
+  ): void {
+    this.traceInstant("paseo.connection.stage", {
+      attemptId: String(this.connectionAttemptId),
+      stage,
+      elapsedMs: String(perfNow() - this.connectionStartedAt),
+    });
+  }
+
+  private armConnectTimeout(
+    transport: DaemonTransport,
+    stage: "dial" | "hello",
+    timeoutMs: number,
+  ): boolean {
+    this.resetConnectTimeout();
+    const expire = (): void => {
+      if (this.transport !== transport || this.connectionState.status !== "connecting") return;
+      const reason = stage === "hello" ? "Daemon hello timed out" : "Connection timed out";
+      this.traceConnectionStage(stage === "hello" ? "hello_timeout" : "dial_timeout");
+      this.lastErrorValue = reason;
+      this.disposeTransport(1001, reason);
+      this.scheduleReconnect({
+        reason,
+        event: stage === "hello" ? "HELLO_TIMEOUT" : "CONNECT_TIMEOUT",
+        reasonCode: stage === "hello" ? "hello_timeout" : "connect_timeout",
+      });
+    };
+    if (timeoutMs <= 0) {
+      expire();
+      return false;
+    }
+    this.connectTimeout = setTimeout(expire, Math.max(1, timeoutMs));
+    return true;
   }
 
   private sendJsonMessage(envelopeType: string, messageType: string, message: unknown): void {
@@ -5988,6 +6064,8 @@ export class DaemonClient {
         event: metadata?.event ?? "STATE_UPDATE",
         connectionPath: this.logConnectionPath,
         generation: this.logGeneration,
+        attemptId: this.connectionAttemptId,
+        connectionElapsedMs: perfNow() - this.connectionStartedAt,
         reasonCode,
         reason,
       },
@@ -6157,6 +6235,7 @@ export class DaemonClient {
       if (serverInfo) {
         this.lastServerInfoMessage = serverInfo;
         if (this.connectionState.status === "connecting") {
+          this.traceConnectionStage("ready");
           this.resetConnectTimeout();
           // A backoff timer armed before this connection succeeded is now a
           // scheduled self-disconnect: when it fires, attemptConnect() disposes

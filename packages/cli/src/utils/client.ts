@@ -18,6 +18,7 @@ import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daem
 import path from "node:path";
 import { WebSocket } from "ws";
 import { getOrCreateCliClientId } from "./client-id.js";
+import { getOrCreateCliDhtSeed } from "./dht-identity.js";
 import { resolveCliVersion } from "../version.js";
 import { createSshTunnel } from "../ssh/ssh-tunnel.js";
 
@@ -362,6 +363,7 @@ async function connectViaPeerInvite(
   clientId: string,
   timeout: number,
 ): Promise<DaemonClient> {
+  const dhtSeed = await getOrCreateCliDhtSeed();
   const client = new DaemonClient({
     url: "ws://hyperdht.invalid/ws",
     clientId,
@@ -370,6 +372,7 @@ async function connectViaPeerInvite(
     connectTimeoutMs: timeout,
     transportFactory: createDhtTransportFactory({
       invite,
+      seed: dhtSeed,
       ...(() => {
         const bs = (process.env.PASEO_DHT_BOOTSTRAP ?? "")
           .split(",")

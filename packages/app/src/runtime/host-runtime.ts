@@ -734,6 +734,13 @@ export class HostRuntimeController {
     const previousActiveConnection = findConnectionById(this.host, activeConnectionId);
     this.host = host;
     this.trackConnectionFirstSeen();
+    const probeByConnectionId = new Map(this.snapshot.probeByConnectionId);
+    for (const connectionId of probeByConnectionId.keys()) {
+      if (!findConnectionById(this.host, connectionId)) probeByConnectionId.delete(connectionId);
+    }
+    if (probeByConnectionId.size !== this.snapshot.probeByConnectionId.size) {
+      this.updateSnapshot({ probeByConnectionId });
+    }
     const nextActiveConnection = findConnectionById(this.host, activeConnectionId);
     if (
       activeConnectionId &&
@@ -869,29 +876,44 @@ export class HostRuntimeController {
 
     let remaining = connectionsToProbe.length;
     let activationLock: Promise<void> | null = null;
+    let probeSwitchVersion = this.switchRequestVersion;
 
     const publishProbeState = (): void => {
       if (!this.isCurrentProbeRequest(requestVersion)) {
         return;
       }
+      for (const connectionId of probeByConnectionId.keys()) {
+        if (!findConnectionById(this.host, connectionId)) probeByConnectionId.delete(connectionId);
+      }
       this.updateSnapshot({ probeByConnectionId: new Map(probeByConnectionId) });
     };
 
-    const maybeActivateFirstAvailable = async (
+    const maybeActivateAvailable = async (
       connectionId: string,
       client: DaemonClient,
     ): Promise<boolean> => {
-      while (!this.snapshot.activeConnectionId) {
+      // Recovery takes the first ready, identity-checked client. Latency-based
+      // switching of an online route still uses the full-cycle hysteresis.
+      while (!this.snapshot.activeConnectionId || this.snapshot.connectionStatus !== "online") {
+        if (
+          !this.isCurrentProbeRequest(requestVersion) ||
+          this.switchRequestVersion !== probeSwitchVersion ||
+          !findConnectionById(this.host, connectionId) ||
+          client.getConnectionState().status !== "connected"
+        )
+          return false;
         if (!activationLock) {
-          activationLock = this.switchToConnection({
+          const switching = this.switchToConnection({
             connectionId,
             expectedProbeVersion: requestVersion,
             existingClient: client,
-          }).finally(() => {
+          });
+          probeSwitchVersion = this.switchRequestVersion;
+          activationLock = switching.finally(() => {
             activationLock = null;
           });
           await activationLock;
-          return this.snapshot.activeConnectionId === connectionId;
+          return this.snapshot.client === client;
         }
         await activationLock;
       }
@@ -902,6 +924,7 @@ export class HostRuntimeController {
       if (remaining > 0 || !this.isCurrentProbeRequest(requestVersion)) {
         return;
       }
+      publishProbeState();
 
       const currentActiveConnectionId = this.snapshot.activeConnectionId;
       const activeProbe = currentActiveConnectionId
@@ -987,17 +1010,16 @@ export class HostRuntimeController {
     await new Promise<void>((resolve) => {
       const settleProbe = (): void => {
         remaining -= 1;
-        void finalizeProbeCycle().finally(() => {
-          if (remaining === 0) {
-            resolve();
-          }
-        });
+        if (remaining === 0) void finalizeProbeCycle().finally(resolve);
       };
 
       for (const connection of connectionsToProbe) {
         void (async () => {
           let connectedClient: DaemonClient | null = null;
           let shouldCloseClient = false;
+          const isCurrentCandidate = (): boolean =>
+            this.isCurrentProbeRequest(requestVersion) &&
+            equal(findConnectionById(this.host, connection.id), connection);
           try {
             const activeClient =
               this.snapshot.connectionStatus === "online" &&
@@ -1026,16 +1048,16 @@ export class HostRuntimeController {
               shouldCloseClient = true;
             }
 
-            if (!this.isCurrentProbeRequest(requestVersion)) {
+            if (!isCurrentCandidate()) {
               return;
             }
 
-            const activated = await maybeActivateFirstAvailable(connection.id, connectedClient);
+            const activated = await maybeActivateAvailable(connection.id, connectedClient);
             shouldCloseClient = shouldCloseClient && !activated;
 
             if (activeClient) {
               const rttMs = activeClient.getLastLivenessRttMs();
-              if (!this.isCurrentProbeRequest(requestVersion)) {
+              if (!isCurrentCandidate()) {
                 return;
               }
               if (rttMs !== null) {
@@ -1049,7 +1071,7 @@ export class HostRuntimeController {
             }
 
             const rttMs = await connectedClient.measureLatency({ timeoutMs: 5000 });
-            if (!this.isCurrentProbeRequest(requestVersion)) {
+            if (!isCurrentCandidate()) {
               return;
             }
 
@@ -1059,7 +1081,7 @@ export class HostRuntimeController {
             });
             publishProbeState();
           } catch {
-            if (this.isCurrentProbeRequest(requestVersion)) {
+            if (isCurrentCandidate()) {
               probeByConnectionId.set(connection.id, {
                 status: "unavailable",
                 latencyMs: null,
@@ -1204,6 +1226,15 @@ export class HostRuntimeController {
     if (this.activeClient) {
       const previousClient = this.activeClient;
       this.activeClient = null;
+      this.applyConnectionEvent({
+        type: "client_state",
+        state: { status: "disposed" },
+        lastError: null,
+      });
+      this.updateSnapshot({
+        ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
+        client: null,
+      });
       await previousClient.close().catch(() => undefined);
     }
   }
@@ -1239,18 +1270,21 @@ export class HostRuntimeController {
       return;
     }
     const requestVersion = ++this.switchRequestVersion;
+    const isValid = (): boolean =>
+      this.isSwitchStillValid(requestVersion, expectedProbeVersion) &&
+      equal(findConnectionById(this.host, connectionId), connection);
 
     const clientId = await this.resolveClientIdForSwitch({ existingClient, requestVersion });
     if (clientId === null) return;
 
-    if (!this.isSwitchStillValid(requestVersion, expectedProbeVersion)) {
+    if (!isValid()) {
       await this.abortSwitchWithClient(existingClient);
       return;
     }
 
     await this.disposePreviousActiveClient();
 
-    if (!this.isSwitchStillValid(requestVersion, expectedProbeVersion)) {
+    if (!isValid()) {
       await this.abortSwitchWithClient(existingClient);
       return;
     }
@@ -1268,7 +1302,7 @@ export class HostRuntimeController {
         runtimeGeneration: nextGeneration,
       });
 
-    if (!this.isSwitchStillValid(requestVersion, expectedProbeVersion)) {
+    if (!isValid()) {
       await client.close().catch(() => undefined);
       return;
     }

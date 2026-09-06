@@ -219,6 +219,14 @@ Agent browser_keypress -> guest sendInputEvent(skipIfUnhandled)
 
 TanStack Router + Cloudflare Workers. Serves paseo.sh.
 
+## Peer connection recovery
+
+A Node `DaemonClient` owns its DHT factory. Reconnects reuse its node and identity; permanent client close releases the factory. Do not share a disposable factory between independently owned clients. Mobile uses a separate owner: the pooled Bare worklet outlives a transport and parks its DHT node before the native thread freezes.
+
+Deploy the native adapter and packed Bare worker together when their IPC changes. The adapter rejects controls and queued application bytes from an older connection generation. This generation is a local lifetime marker, not a device credential. Rebuild with `npm run build:dht-worker --workspace=@getpaseo/app`.
+
+The CLI keeps its random peer seed in `PASEO_HOME/cli-dht-identity`, separate from its public client ID. Back up that file to preserve the device identity. A corrupt seed fails to load; it is not silently replaced. POSIX permissions are restricted to `0600`.
+
 ## WebSocket protocol
 
 All clients speak the same WebSocket protocol over a single connection that mixes JSON text frames and a small binary framing for terminal streams. Schemas live in `packages/protocol/src/messages.ts`.
@@ -247,6 +255,8 @@ Client liveness checks use the top-level JSON `ping`/`pong` envelope, not a sess
 Every physical send path enforces an 8 MiB outbound high-water mark, including JSON broadcasts, binary terminal frames, and the encrypted relay adapter's asynchronous queue. This sits above the terminal stream's 4 MiB soft backpressure threshold, leaving room for snapshot catch-up before the hard cutoff. JSON is serialized once per broadcast after sockets already at the limit are removed, then its exact byte length is checked for every remaining socket. A frame that would cross the limit is not sent; that physical socket is forcibly terminated without disturbing other sockets attached to the same logical session. Multiple tabs and simultaneous direct and relay paths may legitimately share a client id.
 
 Client session RPC waits default to 60s so slow relay or mobile networks do not turn a live but delayed daemon response into a false operation failure. Keep connect timeouts, app-level grace windows, explicit diagnostic latency probes, liveness ping timers, and genuinely long-running RPCs separate from this default.
+
+`connectTimeoutMs` remains the total dial-and-hello budget. An explicit `helloTimeoutMs` caps the wait after transport-open and cannot extend that total budget. Without it, hello uses the remaining total budget. An open received after the total deadline fails before sending hello, even if timer delivery is delayed. `paseo.connection.stage` traces distinguish dial, hello, readiness, and the timeout stage using a local attempt ID and monotonic elapsed time. Keep an open transport distinct from a ready daemon.
 
 New session RPCs use dotted names with `.request` and `.response` suffixes, such as `checkout.forge.set_auto_merge.request` and `checkout.forge.set_auto_merge.response`. See [rpc-namespacing.md](rpc-namespacing.md) for the convention and migration rules for older flat RPC names.
 

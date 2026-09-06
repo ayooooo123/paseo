@@ -7,11 +7,19 @@ export interface DaemonTransport {
   onError: (handler: (event?: unknown) => void) => () => void;
 }
 
-export type DaemonTransportFactory = (options: {
-  url: string;
-  headers?: Record<string, string>;
-  protocols?: string[];
-}) => DaemonTransport;
+export interface DaemonTransportFactory {
+  (options: {
+    url: string;
+    headers?: Record<string, string>;
+    protocols?: string[];
+  }): DaemonTransport;
+  /**
+   * Release process/host-owned factory resources (e.g. a shared HyperDHT node).
+   * Invoked once by the owning DaemonClient's permanent close, never per
+   * reconnect or per stream close.
+   */
+  dispose?: () => void | Promise<void>;
+}
 
 export type WebSocketFactory = (
   url: string,

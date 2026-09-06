@@ -13,6 +13,7 @@ import type {
   DaemonTransport,
   DaemonTransportFactory,
 } from "@getpaseo/client/internal/daemon-client-transport-types";
+import { copyArrayBufferViewToBuffer } from "@getpaseo/client/internal/daemon-client-transport-utils";
 import { getDhtClientSeed } from "./dht-client-identity";
 
 /**
@@ -71,7 +72,7 @@ interface SessionSink {
 
 interface WorkletSession {
   connect(sink: SessionSink): void;
-  send(frame: Uint8Array): void;
+  send(sink: SessionSink, frame: Uint8Array): void;
   release(sink: SessionSink): void;
 }
 
@@ -88,6 +89,8 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
   const decoder = new PeerFrameDecoder();
 
   let sink: SessionSink | null = null;
+  let sinkGeneration = 0;
+  let incomingGeneration = 0;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
 
@@ -174,6 +177,7 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
           ipc?: string;
           message?: string;
           code?: string;
+          connectionId?: number;
           [key: string]: unknown;
         };
         // Lifecycle acks belong to the session, not to whichever transport
@@ -183,10 +187,15 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
           continue;
         }
         if (message.ipc === "resumed") continue;
+        // A queued open identifies the following raw frames on this FIFO IPC
+        // stream. Neither old control nor old application bytes may reach the
+        // replacement transport, even if the worker sent them before close.
+        if (message.ipc === "open") incomingGeneration = message.connectionId ?? 0;
+        if (message.connectionId !== sinkGeneration) continue;
         sink?.onControl(message);
         continue;
       }
-      sink?.onApp(type, payload);
+      if (incomingGeneration === sinkGeneration) sink?.onApp(type, payload);
     }
   });
   ipc.on("close", () => {
@@ -205,6 +214,8 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
       clearTimeout(idleTimer ?? undefined);
       idleTimer = null;
       sink = next;
+      const generation = ++sinkGeneration;
+      incomingGeneration = 0;
       void (async () => {
         const seed = await seedPromise;
         // A release or a newer connect landed while the Keychain read was in
@@ -212,13 +223,15 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
         if (disposed || sink !== next) return;
         control({
           ipc: "connect",
+          connectionId: generation,
           invite: options.invite,
           bootstrap: options.bootstrap,
           ...(seed ? { seed } : {}),
         });
       })();
     },
-    send(frame) {
+    send(owner, frame) {
+      if (sink !== owner) throw new Error("bare dht transport was superseded");
       ipc.write(frame);
     },
     release(previous) {
@@ -274,6 +287,7 @@ export function createBareDhtTransportFactory(
 
     const sink: SessionSink = {
       onControl(message) {
+        if (closed) return;
         if (message.ipc === "open") {
           open = true;
           for (const handler of openHandlers) handler();
@@ -290,9 +304,7 @@ export function createBareDhtTransportFactory(
       },
       onApp(type, payload) {
         if (type === PEER_FRAME_TEXT) deliver(td.decode(payload), false);
-        // slice() already produces an exact-length buffer; copying it again
-        // doubled the cost of every binary message.
-        else if (type === PEER_FRAME_BINARY) deliver(payload.slice().buffer, true);
+        else if (type === PEER_FRAME_BINARY) deliver(copyArrayBufferViewToBuffer(payload), true);
       },
       onError(error) {
         for (const handler of errorHandlers) handler(error);
@@ -308,6 +320,7 @@ export function createBareDhtTransportFactory(
       send: (data) => {
         if (!open) throw new Error("bare dht transport not open");
         active.send(
+          sink,
           typeof data === "string"
             ? encodePeerTextFrame(data)
             : encodePeerBinaryFrame(data instanceof ArrayBuffer ? new Uint8Array(data) : data),

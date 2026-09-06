@@ -761,6 +761,112 @@ describe("HostRuntimeController", () => {
     await probeCycle;
   });
 
+  it.each(["before", "after"] as const)(
+    "recovers before a third probe settles when the active probe fails %s the alternate",
+    async (failureOrder) => {
+      useHostRuntimeClock();
+      const host = makeHost();
+      const [direct, relay] = host.connections;
+      const slow: HostConnection = {
+        id: "direct:slow:6767",
+        type: "directTcp",
+        endpoint: "slow:6767",
+      };
+      host.connections.push(slow);
+      const lateFailure = createDeferred<void>();
+      const slowProbe = createDeferred<void>();
+      let recovering = false;
+      let alternate: FakeDaemonClient | null = null;
+      const controller = new HostRuntimeController({
+        host,
+        deps: {
+          getClientId: async () => "cid_recovery",
+          createClient: () => {
+            throw new Error("Recovery must adopt the ready probe");
+          },
+          connectToDaemon: async ({ connection }) => {
+            if (recovering && connection.id === direct.id) {
+              if (failureOrder === "after") await lateFailure.promise;
+              throw new Error("Active route is unreachable");
+            }
+            if (recovering && connection.id === slow.id) await slowProbe.promise;
+            const client = makeConnectedProbeClient(connection.id === direct.id ? 10 : 30);
+            if (recovering && connection.id === relay.id) alternate = client;
+            return {
+              client: client as unknown as DaemonClient,
+              serverId: host.serverId,
+              hostname: null,
+            };
+          },
+        },
+      });
+      await controller.start({ autoProbe: false });
+      const original = controller.getSnapshot().client as unknown as FakeDaemonClient;
+      original.setConnectionState({ status: "disconnected", reason: "network lost" });
+      recovering = true;
+      await vi.advanceTimersByTimeAsync(120_000);
+      const cycle = controller.runProbeCycleNow();
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(controller.getSnapshot().connectionStatus).toBe("online");
+        expect(controller.getSnapshot().activeConnectionId).toBe(relay.id);
+        expect(controller.getSnapshot().client).toBe(alternate);
+        expect(original.isDisposed()).toBe(true);
+      } finally {
+        if (failureOrder === "after") lateFailure.resolve();
+        slowProbe.resolve();
+        await cycle;
+        await controller.stop();
+      }
+    },
+  );
+
+  it("does not adopt a removed alternate while the previous client is closing", async () => {
+    useHostRuntimeClock();
+    const host = makeHost();
+    const [direct, relay] = host.connections;
+    const closeGate = createDeferred<void>();
+    let recovering = false;
+    let alternate: FakeDaemonClient | null = null;
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        getClientId: async () => "cid_removed_route",
+        createClient: () => {
+          throw new Error("Must not reopen a removed route");
+        },
+        connectToDaemon: async ({ connection }) => {
+          if (recovering && connection.id === direct.id) throw new Error("Route down");
+          const client = makeConnectedProbeClient(20);
+          if (recovering && connection.id === relay.id) alternate = client;
+          return {
+            client: client as unknown as DaemonClient,
+            serverId: host.serverId,
+            hostname: null,
+          };
+        },
+      },
+    });
+    await controller.start({ autoProbe: false });
+    const original = controller.getSnapshot().client as unknown as FakeDaemonClient;
+    original.setConnectionState({ status: "disconnected", reason: "network lost" });
+    original.close = () => closeGate.promise;
+    recovering = true;
+    await vi.advanceTimersByTimeAsync(120_000);
+    const cycle = controller.runProbeCycleNow();
+    await vi.advanceTimersByTimeAsync(0);
+    const updated = controller.updateHost({ ...host, connections: [direct] });
+    expect(controller.getSnapshot().probeByConnectionId.has(relay.id)).toBe(false);
+    closeGate.resolve();
+    await Promise.all([cycle, updated]);
+    expect(controller.getSnapshot().activeConnectionId).not.toBe(relay.id);
+    expect(controller.getSnapshot().probeByConnectionId.has(relay.id)).toBe(false);
+    expect((alternate as FakeDaemonClient | null)?.isDisposed()).toBe(true);
+    expect(controller.getSnapshot().client).toBeNull();
+    expect(controller.getSnapshot().connectionStatus).not.toBe("online");
+    await controller.stop();
+  });
+
   it("ranks the live connection by its heartbeat RTT without pinging it again", async () => {
     useHostRuntimeClock();
     const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
@@ -994,6 +1100,56 @@ describe("HostRuntimeController", () => {
     }
     expect(switched).toBe(true);
     expect(controller.getSnapshot().client).not.toBeNull();
+  });
+
+  it("keeps a probe cycle pending until its final route switch completes", async () => {
+    useHostRuntimeClock();
+    const host = makeHost({ preferredConnectionId: "direct:lan:6767" });
+    host.connections.push({ id: "direct:third:6767", type: "directTcp", endpoint: "third:6767" });
+    const latencies: Record<string, number | Error> = {
+      "direct:lan:6767": 15,
+      "relay:relay.paseo.sh:443": 60,
+      "direct:third:6767": 80,
+    };
+    const controller = new HostRuntimeController({ host, deps: makeDeps(latencies, []) });
+    await controller.start({ autoProbe: false });
+    const original = controller.getSnapshot().client as unknown as FakeDaemonClient;
+    const close = original.close.bind(original);
+    const gate = createDeferred<void>();
+    let closing = false;
+    original.close = async () => {
+      closing = true;
+      await gate.promise;
+      await close();
+    };
+    original.heartbeatReportsRtt(95);
+    latencies["direct:lan:6767"] = 95;
+    latencies["relay:relay.paseo.sh:443"] = 10;
+    let cycle: Promise<void> | undefined;
+    try {
+      for (let index = 0; index < 10; index++) {
+        await vi.advanceTimersByTimeAsync(120_000);
+        let settled = false;
+        cycle = controller.runProbeCycleNow();
+        void cycle.then(() => {
+          settled = true;
+          return undefined;
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        if (closing) {
+          expect(settled).toBe(false);
+          gate.resolve();
+        }
+        await cycle;
+        if (closing) break;
+      }
+      expect(closing).toBe(true);
+      expect(controller.getSnapshot().activeConnectionId).toBe("relay:relay.paseo.sh:443");
+    } finally {
+      gate.resolve();
+      await cycle;
+      await controller.stop();
+    }
   });
 
   it("does not switch on a transient latency spike", async () => {

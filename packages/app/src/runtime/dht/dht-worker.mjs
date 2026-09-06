@@ -46,9 +46,10 @@ let dhtBootstrapKey = null;
 let stream = null;
 let streamId = 0;
 let connectSession = 0;
+let connectionId = null;
+let retryTimer = null;
 let dhtDecoder = null;
 let phase = "idle"; // idle -> connecting -> open
-let publicKey = null;
 
 // hyperdht's suspend() and resume() are async several layers deep and have no
 // internal lock: suspend() sets `_connectable = false` on its first line, then
@@ -64,6 +65,7 @@ async function applyLifecycle(next) {
   // A newer request superseded this one while it waited its turn.
   if (desiredState !== next) return;
   const node = dht;
+  const ownerId = connectionId;
   // No node yet: nothing to park, but RN is waiting on the ack before it
   // freezes the worklet, so answer anyway.
   if (!node) {
@@ -76,6 +78,7 @@ async function applyLifecycle(next) {
   } catch (error) {
     ipcControl({
       ipc: "error",
+      connectionId: ownerId,
       message: String(error?.message ?? error),
       code: error?.code ?? null,
     });
@@ -96,7 +99,29 @@ function requestLifecycle(next) {
 }
 
 function ipcControl(message) {
-  ipc.write(encodePeerFrame(PEER_FRAME_CONTROL, te.encode(JSON.stringify(message))));
+  ipc.write(
+    encodePeerFrame(PEER_FRAME_CONTROL, te.encode(JSON.stringify({ connectionId, ...message }))),
+  );
+}
+
+/** Cancel a scheduled dial retry, if one is pending. */
+function clearRetry() {
+  if (retryTimer === null) return;
+  clearTimeout(retryTimer);
+  retryTimer = null;
+}
+
+/**
+ * Invalidate the current dial intent. A connect() that is still waiting out an
+ * await must lose, and a scheduled retry must not fire: bumping connectSession
+ * makes every stale guard fail, and clearing retryTimer stops the timer
+ * outright. Every control that has to guarantee "no dial survives me" — close,
+ * suspend, shutdown, and a hyperdht network-change — calls this first. A later
+ * connect() claims a fresh session and dials again.
+ */
+function invalidateDial() {
+  clearRetry();
+  connectSession++;
 }
 
 /** Drop the current stream but keep the DHT node warm for the next dial. */
@@ -112,11 +137,35 @@ function closeStream() {
   return hadStream;
 }
 
-/** Tear everything down, including the node. Only on worklet shutdown. */
-function teardown() {
-  // No connectSession bump: connect() calls this on bootstrap change before
-  // dialing with its already-claimed session, and a pending retry timer is
-  // already stopped by the !dht check below (teardown nulls the node).
+/**
+ * hyperdht 6.33.2 emits 'network-change' from dht-rpc's interface watcher when
+ * the OS swaps networks under the node. Upstream does not recover a client
+ * dial from it: hyperdht refreshes only its *listening* servers
+ * (hyperdht/index.js), and dht-rpc just re-emits. The sockets a dial or an
+ * open stream was using are on the dead interface, so cancel the live dial,
+ * tell RN "closed" (RN redials over the same warm node), and keep the node —
+ * its routing table and peer cache are what make that redial cheap, and
+ * dht-rpc refreshes the table in the background. Destroying the node here
+ * would repay the bootstrap on every network flip.
+ */
+function onNetworkChange(node) {
+  return () => {
+    // A change event from a node this worker already replaced or destroyed.
+    if (dht !== node) return;
+    // Cancel pending continuations as well as sockets bound to the old network.
+    if (phase === "idle" && stream === null && retryTimer === null) return;
+    invalidateDial();
+    closeStream();
+    ipcControl({ ipc: "closed" });
+  };
+}
+
+/**
+ * Replace the node because the bootstrap set changed, keeping the caller's
+ * dial session alive. teardown() must not be used here: it invalidates the
+ * session, and this connect is still the current one.
+ */
+function rebuildNode() {
   closeStream();
   const node = dht;
   dht = null;
@@ -125,50 +174,60 @@ function teardown() {
   node?.destroy().catch(() => {});
 }
 
-async function connect(invite, bootstrap, seed) {
-  // Claim the session before the first await: a stale connect that finishes
-  // its awaits after a newer one must lose, so order is taken at call time.
+/** Tear everything down, including the node. Only on worklet shutdown. */
+function teardown() {
+  // Invalidate before destroying: a connect() still inside its awaits must not
+  // rebuild a node after shutdown and dial, and a pending retry must not fire
+  // on whatever replaces it.
+  invalidateDial();
+  closeStream();
+  const node = dht;
+  dht = null;
+  dhtBootstrapKey = null;
+  // destroy() is async — an unhandled rejection here would take down the worklet.
+  node?.destroy().catch(() => {});
+}
+
+async function connect(invite, bootstrap, seed, ownerId) {
   const session = ++connectSession;
-  await loadNativeModules();
+  connectionId = ownerId;
+  clearRetry();
+  closeStream();
+  phase = "connecting";
+  try {
+    await loadNativeModules();
+    if (session !== connectSession) return;
+    const target = decodePeerInvite(invite).publicKey;
+    const bootstrapKey = bootstrap && bootstrap.length ? bootstrap.join(",") : "";
+    if (dht && dhtBootstrapKey !== bootstrapKey) rebuildNode();
+    if (!dht) {
+      const node = new DHT({
+        ...(bootstrapKey ? { bootstrap } : {}),
+        // Paseo's heartbeat detects liveness; this foreground keepalive keeps
+        // the NAT mapping without the default five-second radio wakeup.
+        connectionKeepAlive: 25_000,
+      });
+      node.on("network-change", onNetworkChange(node));
+      dht = node;
+      dhtBootstrapKey = bootstrapKey;
+    }
 
-  publicKey = decodePeerInvite(invite).publicKey;
-
-  // Reuse the node across reconnects: a fresh DHT throws away the routing table
-  // and the cached peer address, so every reconnect would re-bootstrap and dial
-  // cold. Only rebuild it when the bootstrap set actually changes.
-  const bootstrapKey = bootstrap && bootstrap.length ? bootstrap.join(",") : "";
-  if (dht && dhtBootstrapKey !== bootstrapKey) teardown();
-  if (!dht) {
-    dht = new DHT({
-      ...(bootstrapKey ? { bootstrap } : {}),
-      // hyperdht defaults this to 5000, which writes an empty frame on every
-      // open socket every 5s. Paseo already runs its own 10s liveness ping
-      // (DaemonClient LIVENESS_HEARTBEAT_INTERVAL_MS), so the socket-level
-      // keepalive only has to outlive the NAT mapping, not detect death.
-      // Cellular UDP mappings run minutes, so 25s is well inside the envelope
-      // and wakes the radio a fifth as often. Foreground only — a backgrounded
-      // app is frozen and sends nothing regardless.
-      connectionKeepAlive: 25_000,
+    // suspend/resume are serialized. A close during this await must also
+    // report the pending dial as closed so foreground recovery can redial.
+    phase = "connecting";
+    await requestLifecycle("resumed");
+    if (session !== connectSession) return;
+    const keyPair = seed ? DHT.keyPair(decodeBase64Url(seed)) : undefined;
+    attemptDial({ session, connectionId: ownerId, node: dht, target, keyPair }, 1);
+  } catch (error) {
+    if (session !== connectSession) return;
+    ipcControl({
+      ipc: "error",
+      connectionId: ownerId,
+      message: String(error?.message ?? error),
+      code: error?.code ?? null,
     });
-    dhtBootstrapKey = bootstrapKey;
-  } else {
-    closeStream();
   }
-
-  // A dial made while the node is parked is destroyed on the spot with a
-  // SUSPENDED error (hyperdht/lib/connect.js:61-65), and suspend() sets
-  // `_connectable = false` on its first line. So wait out whatever transition
-  // is in flight and put the node in the resumed state before asking for a
-  // stream. This is the whole background→foreground→dial path.
-  await requestLifecycle("resumed");
-
-  // A stable client keypair, derived from the seed RN keeps in secure storage.
-  // Without it hyperdht mints a throwaway key per dial and the daemon sees a
-  // different peer every reconnect. reusableSocket keeps the punched UDP route
-  // in the socket pool for 3s after close (lib/socket-pool.js LINGER_TIME), so
-  // a quick leave-and-return redials without punching again.
-  const keyPair = seed ? DHT.keyPair(decodeBase64Url(seed)) : undefined;
-  attemptDial(session, keyPair, 1);
 }
 
 // One hyperdht connect() is exactly one attempt: a transient failure destroys
@@ -178,14 +237,15 @@ async function connect(invite, bootstrap, seed) {
 // cleanly on the very next dial. Pre-open only — once open, an error is a
 // dropped connection, not a dial failure — and the node stays warm, because a
 // fresh node would repay the DHT bootstrap on every attempt.
-function attemptDial(session, keyPair, attempt) {
-  // A superseded connect bails before spending a dial.
-  if (session !== connectSession) return;
+function attemptDial(ctx, attempt) {
+  // A superseded connect bails before spending a dial; the node check stops a
+  // scheduled retry from dialing on a node that was rebuilt or destroyed since.
+  if (ctx.session !== connectSession || ctx.node !== dht) return;
   const id = ++streamId;
-  const live = () => streamId === id && session === connectSession;
-  stream = dht.connect(publicKey, {
+  const live = () => streamId === id && dht === ctx.node && connectSession === ctx.session;
+  stream = ctx.node.connect(ctx.target, {
     reusableSocket: true,
-    ...(keyPair ? { keyPair } : {}),
+    ...(ctx.keyPair ? { keyPair: ctx.keyPair } : {}),
   });
   dhtDecoder = new PeerFrameDecoder();
   phase = "connecting";
@@ -194,7 +254,7 @@ function attemptDial(session, keyPair, attempt) {
     if (!live()) return;
     // HyperDHT authenticated the dial, so the stream is usable immediately.
     phase = "open";
-    ipcControl({ ipc: "open" });
+    ipcControl({ ipc: "open", connectionId: ctx.connectionId });
   });
   stream.on("error", (error) => {
     const code = error?.code ?? null;
@@ -213,25 +273,32 @@ function attemptDial(session, keyPair, attempt) {
       try {
         failed?.destroy();
       } catch {}
-      setTimeout(() => {
-        // A suspend or teardown during the backoff ends the ladder quietly;
-        // the foreground redial path starts a fresh connect.
-        if (session !== connectSession || !dht || desiredState !== "resumed") return;
-        attemptDial(session, keyPair, attempt + 1);
+      clearRetry();
+      const timer = setTimeout(() => {
+        // Only this timer clears itself: a newer ladder may have replaced
+        // retryTimer while this one was pending, and must stay cancellable.
+        if (retryTimer === timer) retryTimer = null;
+        // close/suspend/shutdown superseded the dial, or the node it dialed on
+        // is gone; the ladder ends quietly and a fresh connect starts over.
+        if (ctx.session !== connectSession || ctx.node !== dht || desiredState !== "resumed")
+          return;
+        attemptDial(ctx, attempt + 1);
       }, DHT_DIAL_RETRY_BASE_MS * attempt);
+      retryTimer = timer;
       return;
     }
     ipcControl({
       ipc: "error",
+      connectionId: ctx.connectionId,
       message: String(error?.message ?? error),
       code,
     });
   });
   stream.on("end", () => {
-    if (live()) ipcControl({ ipc: "closed" });
+    if (live()) ipcControl({ ipc: "closed", connectionId: ctx.connectionId });
   });
   stream.on("close", () => {
-    if (live()) ipcControl({ ipc: "closed" });
+    if (live()) ipcControl({ ipc: "closed", connectionId: ctx.connectionId });
   });
   stream.on("data", (chunk) => {
     if (!live()) return;
@@ -263,18 +330,17 @@ ipc.on("data", (chunk) => {
     if (type === PEER_FRAME_CONTROL) {
       const message = JSON.parse(td.decode(payload));
       if (message.ipc === "connect") {
-        // An unhandled rejection here aborts the worklet thread and with it the
-        // whole app, so every dial failure — including a missing native addon —
-        // has to come back as an IPC error the RN side can surface.
-        connect(message.invite, message.bootstrap, message.seed).catch((error) => {
-          ipcControl({
-            ipc: "error",
-            message: String(error?.message ?? error),
-            code: error?.code ?? null,
-          });
-        });
-      } else if (message.ipc === "close") closeStream();
-      else if (message.ipc === "shutdown") teardown();
+        // connect catches native-addon failures without taking down the worklet.
+        void connect(message.invite, message.bootstrap, message.seed, message.connectionId);
+      } else if (message.ipc === "close") {
+        // RN released the sink: no dial may outlive it. Invalidate so an
+        // in-flight connect bails at its next guard and a scheduled retry is
+        // cancelled — neither may dial after RN moved on.
+        invalidateDial();
+        closeStream();
+      } else if (message.ipc === "shutdown") {
+        teardown();
+      }
       // Backgrounding. Note what suspend does NOT do: hyperdht's suspend()
       // calls rawStreams.clear() (index.js:113-118), which destroys every
       // stream in the set (lib/raw-stream-set.js:26-34). The open stream does
@@ -283,12 +349,18 @@ ipc.on("data", (chunk) => {
       // anyway and a parked node resumes without re-bootstrapping.
       else if (message.ipc === "suspend") {
         // closeStream() invalidates the stream handlers before destroy(), so
-        // their close event is intentionally ignored. Tell RN explicitly: it
-        // must enter disconnected state now so foreground retryAllNow() can
-        // redial immediately instead of waiting for heartbeat expiry.
-        if (closeStream()) ipcControl({ ipc: "closed" });
+        // their close event is intentionally ignored. Tell RN explicitly — for
+        // an open stream and for a retry sitting in backoff — so it enters
+        // disconnected state now and foreground retryAllNow() can redial
+        // immediately instead of waiting for heartbeat expiry.
+        const hadDial = phase !== "idle" || stream !== null || retryTimer !== null;
+        invalidateDial();
+        closeStream();
+        if (hadDial) ipcControl({ ipc: "closed" });
         void requestLifecycle("suspended");
-      } else if (message.ipc === "resume") void requestLifecycle("resumed");
+      } else if (message.ipc === "resume") {
+        void requestLifecycle("resumed");
+      }
       continue;
     }
     // Application frame from RN -> forward to the daemon over the DHT stream.

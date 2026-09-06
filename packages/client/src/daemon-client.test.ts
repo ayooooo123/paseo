@@ -1,11 +1,6 @@
 import { afterEach, expect, expectTypeOf, test, vi } from "vitest";
 import { z } from "zod";
-import {
-  DaemonClient,
-  type DaemonClientTrace,
-  type DaemonTransport,
-  type Logger,
-} from "./daemon-client";
+import { DaemonClient, type DaemonTransport, type Logger } from "./daemon-client";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
@@ -36,24 +31,6 @@ function createMockLogger() {
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-  };
-}
-
-interface TraceRecord {
-  phase: "begin" | "end";
-  name?: string;
-  args?: Record<string, string>;
-}
-
-function createTraceRecorder(): { trace: DaemonClientTrace; records: TraceRecord[] } {
-  const records: TraceRecord[] = [];
-  return {
-    trace: {
-      isEnabled: () => true,
-      beginSection: (name, args) => records.push({ phase: "begin", name, args }),
-      endSection: () => records.push({ phase: "end" }),
-    },
-    records,
   };
 }
 
@@ -192,56 +169,6 @@ afterEach(async () => {
   clients.length = 0;
   vi.useRealTimers();
   vi.unstubAllGlobals();
-});
-
-test("traces WebSocket frames, message types, and JSON parse duration", async () => {
-  const mock = createMockTransport();
-  const recorder = createTraceRecorder();
-  const client = new DaemonClient({
-    url: "ws://test",
-    clientId: "trace_unit_test",
-    transportFactory: () => mock.transport,
-    reconnect: { enabled: false },
-    trace: recorder.trace,
-  });
-  clients.push(client);
-
-  const connectPromise = client.connect();
-  mock.triggerOpen({ preserveSent: true });
-  await connectPromise;
-
-  expect(recorder.records).toEqual([
-    {
-      phase: "begin",
-      name: "paseo.ws.message.outbound",
-      args: { envelopeType: "hello", messageType: "hello" },
-    },
-    { phase: "end" },
-    {
-      phase: "begin",
-      name: "paseo.ws.frame.outbound",
-      args: { kind: "text", size: expect.any(String) },
-    },
-    { phase: "end" },
-    {
-      phase: "begin",
-      name: "paseo.ws.frame.inbound",
-      args: { kind: "text", size: expect.any(String) },
-    },
-    {
-      phase: "begin",
-      name: "paseo.ws.json.parse",
-      args: { size: expect.any(String) },
-    },
-    { phase: "end" },
-    {
-      phase: "begin",
-      name: "paseo.ws.message.inbound",
-      args: { envelopeType: "session", messageType: "status" },
-    },
-    { phase: "end" },
-    { phase: "end" },
-  ]);
 });
 
 test("does not infer browser automation capabilities from Electron runtime", async () => {
@@ -1145,6 +1072,7 @@ test("a generic transport error followed by an open still redials", async () => 
     clientId: "clsk_hung_dial_retry",
     reconnect: { enabled: true, baseDelayMs: 1_500 },
     connectTimeoutMs: 20_000,
+    helloTimeoutMs: 20_000,
     transportFactory: () => {
       const mock = createMockTransport();
       mocks.push(mock);
@@ -3575,6 +3503,86 @@ test("reconnects after relay close with replaced-by-new-connection reason", asyn
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("releases the configured transport factory only on permanent close", async () => {
+  useHeartbeatClock();
+  try {
+    const first = createMockTransport();
+    const second = createMockTransport();
+    const transports = [first, second];
+    let transportIndex = 0;
+    const dispose = vi.fn();
+    const transportFactory = Object.assign(
+      () => {
+        const next = transports[Math.min(transportIndex, transports.length - 1)];
+        transportIndex += 1;
+        return next.transport;
+      },
+      { dispose },
+    );
+
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "factory_dispose_unit_test",
+      reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+      transportFactory,
+    });
+    clients.push(client);
+
+    const connectPromise = client.connect();
+    first.triggerOpen();
+    await connectPromise;
+    expect(client.getConnectionState().status).toBe("connected");
+
+    // A reconnect opens a second transport from the same factory. The factory
+    // must survive stream teardown — dispose only belongs to permanent close.
+    first.triggerClose();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(client.getConnectionState().status).toBe("connecting");
+    second.triggerOpen();
+    expect(client.getConnectionState().status).toBe("connected");
+    expect(dispose).not.toHaveBeenCalled();
+
+    await client.close();
+    // close() is idempotent: a second call must not dispose again.
+    await client.close();
+    expect(dispose).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("overlapping closes wait on the same in-flight factory dispose", async () => {
+  let releaseDispose: () => void = () => {};
+  const disposeDone = new Promise<void>((resolve) => {
+    releaseDispose = resolve;
+  });
+  const dispose = vi.fn(() => disposeDone);
+  const transportFactory = Object.assign(() => createMockTransport().transport, { dispose });
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "overlap_close_unit_test",
+    reconnect: { enabled: false },
+    transportFactory,
+  });
+  clients.push(client);
+
+  const firstClose = client.close();
+  const secondClose = client.close();
+  let secondSettled = false;
+  void secondClose.then(() => {
+    secondSettled = true;
+    return undefined;
+  });
+
+  // The second close must not resolve while the factory dispose is pending.
+  expect(secondSettled).toBe(false);
+  releaseDispose();
+  await Promise.all([firstClose, secondClose]);
+  expect(secondSettled).toBe(true);
+  expect(dispose).toHaveBeenCalledTimes(1);
 });
 
 test("requires non-empty clientId", () => {
