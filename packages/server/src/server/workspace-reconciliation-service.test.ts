@@ -1569,4 +1569,94 @@ describe("WorkspaceReconciliationService", () => {
       mainRepoRoot: "/tmp/main-repo",
     });
   });
+
+  test("sequences root reconciliation with at most one in-flight read and isolates failures", async () => {
+    const baseDir = mkdtempSync(path.join(tmpdir(), "reconcile-sequential-set-"));
+    tempDirs.push(baseDir);
+    const { projects, projectRegistry, workspaceRegistry } = createTestRegistries();
+
+    const projectCount = 4;
+    const rootPaths: string[] = [];
+    for (let i = 0; i < projectCount; i++) {
+      const rootPath = path.join(baseDir, `repo-${i}`);
+      mkdirSync(rootPath);
+      rootPaths.push(rootPath);
+      projects.set(
+        `prj_${i}`,
+        createPersistedProjectRecord({
+          projectId: `prj_${i}`,
+          rootPath,
+          kind: "non_git",
+          displayName: `repo-${i}`,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+    }
+
+    const startedGates = rootPaths.map(() => deferred());
+    const allowReadGates = rootPaths.map(() => deferred());
+    const startedRoots: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    const checkouts: Pick<WorkspaceGitService, "getCheckout"> = {
+      getCheckout: async (cwd: string) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        const index = rootPaths.indexOf(cwd);
+        if (index >= 0) {
+          startedRoots.push(cwd);
+          startedGates[index]!.resolve();
+          await allowReadGates[index]!.promise;
+        }
+        inFlight--;
+        if (index === 1) {
+          throw new Error("Simulated Git failure for repo-1");
+        }
+        return createCheckout(cwd, { isGit: true });
+      },
+    };
+
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      workspaceGitService: checkouts,
+      logger: createTestLogger(),
+    });
+
+    const reconciliationPromise = service.reconcileGitMetadata();
+
+    // 1. Only root 0 starts initially (max in-flight is 1)
+    await startedGates[0]!.promise;
+    expect(startedRoots).toEqual([rootPaths[0]]);
+    expect(maxInFlight).toBe(1);
+
+    // Release root 0 -> root 1 starts next
+    allowReadGates[0]!.resolve();
+    await startedGates[1]!.promise;
+    expect(startedRoots).toEqual([rootPaths[0], rootPaths[1]]);
+    expect(maxInFlight).toBe(1);
+
+    // Release root 1 (which throws) -> error is isolated and root 2 still starts
+    allowReadGates[1]!.resolve();
+    await startedGates[2]!.promise;
+    expect(startedRoots).toEqual([rootPaths[0], rootPaths[1], rootPaths[2]]);
+    expect(maxInFlight).toBe(1);
+
+    // Release root 2 -> root 3 starts next
+    allowReadGates[2]!.resolve();
+    await startedGates[3]!.promise;
+    expect(startedRoots).toEqual([rootPaths[0], rootPaths[1], rootPaths[2], rootPaths[3]]);
+    expect(maxInFlight).toBe(1);
+
+    // Release root 3
+    allowReadGates[3]!.resolve();
+
+    const result = await reconciliationPromise;
+    expect(maxInFlight).toBe(1);
+    expect(startedRoots).toEqual(rootPaths);
+    // repos 0, 2, and 3 succeeded; repo 1 was safely skipped
+    expect(result.changesApplied).toHaveLength(3);
+  });
 });

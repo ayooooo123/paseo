@@ -1000,11 +1000,7 @@ export class HostRuntimeController {
           let shouldCloseClient = false;
           try {
             const activeClient =
-              this.snapshot.connectionStatus === "online" &&
-              this.snapshot.activeConnectionId === connection.id
-                ? this.snapshot.client
-                : null;
-
+              this.snapshot.activeConnectionId === connection.id ? this.activeClient : null;
             if (activeClient) {
               connectedClient = activeClient;
             } else {

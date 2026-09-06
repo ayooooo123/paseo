@@ -814,6 +814,56 @@ describe("HostRuntimeController", () => {
     });
     expect(activeClient.latencyMeasurements()).toEqual([]);
   });
+  it("does not create a probe client while the active client is disconnected or reconnecting", async () => {
+    useHostRuntimeClock();
+    const directConnection: HostConnection = {
+      id: "direct:lan:6767",
+      type: "directTcp",
+      endpoint: "192.168.1.50:6767",
+    };
+    const host = makeHost({
+      connections: [directConnection],
+      preferredConnectionId: directConnection.id,
+    });
+    const probeAttempts: string[] = [];
+    const controller = new HostRuntimeController({
+      host,
+      deps: {
+        createClient: () => {
+          throw new Error("should adopt probe clients");
+        },
+        connectToDaemon: async ({ host: hostProfile, connection }) => {
+          probeAttempts.push(connection.id);
+          return {
+            client: makeConnectedProbeClient(12) as unknown as DaemonClient,
+            serverId: hostProfile.serverId,
+            hostname: hostProfile.label ?? null,
+          };
+        },
+        getClientId: async () => "cid_test_runtime",
+      },
+    });
+
+    await controller.start({ autoProbe: false });
+    expect(controller.getSnapshot().activeConnectionId).toBe("direct:lan:6767");
+    expect(controller.getSnapshot().connectionStatus).toBe("online");
+
+    const initialClient = controller.getSnapshot().client;
+    const initialGeneration = controller.getSnapshot().clientGeneration;
+    probeAttempts.length = 0;
+
+    const activeClient = controller.getSnapshot().client as unknown as FakeDaemonClient;
+    activeClient.setConnectionState({ status: "disconnected", reason: "transport closed" });
+    expect(controller.getSnapshot().connectionStatus).toBe("error");
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await controller.runProbeCycleNow();
+
+    expect(probeAttempts).toEqual([]);
+    expect(controller.getSnapshot().activeConnectionId).toBe("direct:lan:6767");
+    expect(controller.getSnapshot().client).toBe(initialClient);
+    expect(controller.getSnapshot().clientGeneration).toBe(initialGeneration);
+  });
 
   it("rejects probes that resolve to a different server id", async () => {
     const host = makeHost({

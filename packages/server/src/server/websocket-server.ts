@@ -1821,8 +1821,10 @@ export class VoiceAssistantWebSocketServer {
       const err = error instanceof Error ? error : new Error(String(error));
       const active = this.sessions.get(ws);
       const pending = this.pendingConnections.get(ws);
+      const identity = this.socketIdentities.get(ws) ?? pending?.identity;
+      const identityFields = identity ? toConnectionLogFields(identity) : {};
       const log = active?.connectionLogger ?? pending?.connectionLogger ?? this.logger;
-      log.error({ err }, "Client error");
+      log.error({ ...identityFields, err }, "Client error");
       await this.detachSocket(ws, { error: err });
     });
   }

@@ -19,7 +19,6 @@ import { deriveProjectKey } from "./project-key.js";
 
 const DEFAULT_RESCAN_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_DEBOUNCE_MS = 100;
-
 export type ProjectUpdate =
   | { kind: "upsert"; project: PersistedProjectRecord }
   | { kind: "remove"; projectId: string };
@@ -310,39 +309,41 @@ export class WorkspaceReconciliationService {
       if (root) root.projects.push(project);
       else roots.push({ rootPath: project.rootPath, projects: [project] });
     }
-    await Promise.all(
-      roots.map(async ({ rootPath, projects }) => {
-        try {
-          const rootGit = await readCheckout(rootPath);
-          await Promise.all(
-            projects.map((project) =>
-              this.reconcileProject({
-                project,
-                siblings: workspacesByProject.get(project.projectId) ?? [],
-                currentGit: rootGit,
-                readCheckout,
-                changes,
-              }),
-            ),
-          );
-        } catch (error) {
-          this.logger.warn(
-            { err: error, rootPath },
-            "Skipped workspace reconciliation after Git read failed",
-          );
+
+    for (const { rootPath, projects } of roots) {
+      if (this.disposed) return;
+      try {
+        const rootGit = await readCheckout(rootPath);
+        for (const project of projects) {
+          if (this.disposed) return;
+          await this.reconcileProject({
+            project,
+            siblings: workspacesByProject.get(project.projectId) ?? [],
+            currentGit: rootGit,
+            readCheckout,
+            changes,
+          });
         }
-      }),
-    );
+      } catch (error) {
+        this.logger.warn(
+          { err: error, rootPath },
+          "Skipped workspace reconciliation after Git read failed",
+        );
+      }
+    }
   }
 
   private async reconcileProject(input: ProjectReconciliationInput): Promise<void> {
     const { project, siblings, currentGit, readCheckout, changes } = input;
-    const workspaceCheckouts = await Promise.all(
-      siblings.map(async (workspace) => ({
-        workspace,
-        checkout: await readCheckout(workspace.cwd),
-      })),
-    );
+    const workspaceCheckouts: Array<{
+      workspace: PersistedWorkspaceRecord;
+      checkout: ProjectCheckoutLitePayload;
+    }> = [];
+    for (const workspace of siblings) {
+      if (this.disposed) return;
+      const checkout = await readCheckout(workspace.cwd);
+      workspaceCheckouts.push({ workspace, checkout });
+    }
     const projectUpdates: Partial<Pick<PersistedProjectRecord, "kind" | "projectKey">> = {};
     const mappedKind = deriveProjectKind(currentGit);
     const projectKey = deriveProjectKey({
