@@ -893,11 +893,8 @@ export const zhCN: TranslationResources = {
         refresh: "刷新",
         refreshState: "刷新 git 和 {{brand}} 状态",
         failedRefresh: "刷新 git 状态失败。",
-        emptyHiddenWhitespace: "隐藏空白差异后没有可见变更",
-        emptyUncommitted: "没有未 commit 的变更",
         seeUncommittedChanges: "查看未 commit 的变更",
         seeCommittedChanges: "查看已 commit 的变更",
-        emptyAgainstBase: "相对于 {{baseRef}} 没有变更",
         checkingRepository: "正在检查 repository...",
         notRepository: "不是 git repository",
         diffMode: "Diff 模式",
@@ -1035,6 +1032,16 @@ export const zhCN: TranslationResources = {
       deleteMessage_other: "这会从此主机的{{count}}个工作区中移除该标签。",
       offline: "此主机离线。",
       updateHost: "请更新此主机以管理标签。",
+    },
+  },
+  changelog: {
+    title: "新功能",
+    installed: "已安装",
+    showMore: "显示更多",
+    openWebsite: "完整更新日志",
+    error: {
+      title: "无法加载更新日志",
+      description: "请检查网络连接后重试。",
     },
   },
   sidebar: {
@@ -2046,6 +2053,7 @@ export const zhCN: TranslationResources = {
     about: {
       title: "关于",
       appVersion: "应用版本",
+      whatsNewHint: "每个版本的发布说明",
       thisDevice: "此设备",
       connectedHosts: "已连接的 Host",
       offline: "离线",

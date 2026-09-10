@@ -912,11 +912,8 @@ export const ja: TranslationResources = {
         refresh: "更新",
         refreshState: "gitと{{brand}}の状態を更新",
         failedRefresh: "gitの状態の更新に失敗しました。",
-        emptyHiddenWhitespace: "空白を非表示にすると変更は表示されません",
-        emptyUncommitted: "未コミットの変更なし",
         seeUncommittedChanges: "未コミットの変更を表示",
         seeCommittedChanges: "コミット済みの変更を表示",
-        emptyAgainstBase: "{{baseRef}}との差分なし",
         checkingRepository: "リポジトリを確認中...",
         notRepository: "gitリポジトリではありません",
         diffMode: "差分モード",
@@ -1054,6 +1051,16 @@ export const ja: TranslationResources = {
       deleteMessage_other: "このホストの{{count}}個のワークスペースからラベルを削除します。",
       offline: "このホストはオフラインです。",
       updateHost: "ラベルを管理するにはホストを更新してください。",
+    },
+  },
+  changelog: {
+    title: "新着情報",
+    installed: "インストール済み",
+    showMore: "もっと見る",
+    openWebsite: "変更履歴をすべて表示",
+    error: {
+      title: "変更履歴を読み込めません",
+      description: "接続を確認してもう一度お試しください。",
     },
   },
   sidebar: {
@@ -2087,6 +2094,7 @@ export const ja: TranslationResources = {
     about: {
       title: "アプリ情報",
       appVersion: "アプリバージョン",
+      whatsNewHint: "各バージョンのリリースノート",
       thisDevice: "このデバイス",
       connectedHosts: "接続されているホスト",
       offline: "オフライン",

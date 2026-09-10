@@ -35,6 +35,30 @@ export interface TimelineReplicaStorage {
   commitTimeline(serverId: string, agentId: string, timeline: CachedTimeline): void;
 }
 
+async function readCachedSnapshot(
+  storage: TimelineReplicaStorage,
+  serverId: string,
+  agentId: string,
+): Promise<{ agent?: Agent; timeline?: CachedTimeline }> {
+  if (storage.readChatSnapshot) {
+    return storage.readChatSnapshot(serverId, agentId);
+  }
+  return { timeline: await storage.readTimeline?.(serverId, agentId) };
+}
+
+function canAdmitRangelessCache(
+  beforeHead: unknown,
+  currentHead: unknown,
+  beforeTimeline: AgentTimelineState,
+  currentTimeline: AgentTimelineState,
+): boolean {
+  if (currentHead !== beforeHead) return false;
+  if (beforeTimeline.status === "painted") {
+    return currentTimeline.status === "painted" && currentTimeline.items === beforeTimeline.items;
+  }
+  return currentTimeline.status === "cold";
+}
+
 async function prepareCachedTimeline(input: {
   serverId: string;
   agentId: string;
@@ -45,9 +69,7 @@ async function prepareCachedTimeline(input: {
   const beforeTimeline = selectAgentTimelineState(before, input.agentId);
   if (beforeTimeline.status === "synced") return undefined;
   const beforeHead = before?.agentStreamHead.get(input.agentId);
-  const snapshot = input.storage.readChatSnapshot
-    ? await input.storage.readChatSnapshot(input.serverId, input.agentId)
-    : { timeline: await input.storage.readTimeline?.(input.serverId, input.agentId) };
+  const snapshot = await readCachedSnapshot(input.storage, input.serverId, input.agentId);
   await input.prepareAgent(input.agentId, snapshot.agent);
   const stored = snapshot.timeline;
   if (!stored) return undefined;
@@ -55,31 +77,30 @@ async function prepareCachedTimeline(input: {
   const currentTimeline = selectAgentTimelineState(session, input.agentId);
   const currentHead = session?.agentStreamHead.get(input.agentId);
   if (currentTimeline.status === "synced") return undefined;
-  if (!stored.range) {
-    if (currentHead !== beforeHead) return undefined;
-    if (beforeTimeline.status === "painted") {
-      return currentTimeline.status === "painted" && currentTimeline.items === beforeTimeline.items
-        ? stored
-        : undefined;
-    }
-    if (currentTimeline.status !== "cold") return undefined;
+  if (
+    !stored.range &&
+    !canAdmitRangelessCache(beforeHead, currentHead, beforeTimeline, currentTimeline)
+  ) {
+    return undefined;
   }
   const liveItems =
     currentTimeline.status === "painted"
       ? [...currentTimeline.items, ...(currentHead ?? [])]
       : (currentHead ?? []);
-  const replacement = stored.range
-    ? replaceWithCanonicalStream({
-        canonical: stored.items,
-        previousTail: [],
-        previousHead: liveItems,
-        sendingClientMessageIds: getSendingClientMessageIds(
-          session?.messageSubmissions.get(input.agentId),
-        ),
-        preserveContinuity: true,
-        canonicalCoverage: stored.range,
-      })
-    : { tail: stored.items, head: liveItems, acknowledgedClientMessageIds: [] };
+  const replacement = replaceWithCanonicalStream({
+    canonical: stored.items,
+    previousTail: [],
+    previousHead: liveItems,
+    sendingClientMessageIds: getSendingClientMessageIds(
+      session?.messageSubmissions.get(input.agentId),
+    ),
+    preserveContinuity: true,
+    // Display-only rows claim no coverage over the live head.
+    canonicalCoverage: stored.range ?? {
+      epoch: liveItems.find((item) => item.timelineCursor)?.timelineCursor?.epoch ?? "",
+      endSeq: null,
+    },
+  });
   useSessionStore.getState().applyAgentTimelineResponseState(input.serverId, input.agentId, {
     items: replacement.tail,
     head: replacement.head,
@@ -146,13 +167,13 @@ class TimelineReplicaOwner implements TimelineReplica {
   timelineUpdated(agentId: string): void {
     const session = useSessionStore.getState().sessions[this.serverId];
     const timeline = selectAgentTimelineState(session, agentId);
-    if (timeline.status !== "synced") return;
-    this.cachedRanges.delete(agentId);
+    if (timeline.status === "cold") return;
+    if (timeline.status === "synced") this.cachedRanges.delete(agentId);
     this.storage.commitTimeline(this.serverId, agentId, {
       agentId,
       items: [...timeline.items, ...(session?.agentStreamHead.get(agentId) ?? [])],
-      range: timeline.range,
-      hasOlder: timeline.older === "available",
+      range: timeline.status === "synced" ? timeline.range : null,
+      hasOlder: timeline.status === "synced" && timeline.older === "available",
     });
   }
 }
@@ -260,7 +281,7 @@ function finalizeProcessedTimeline(input: {
       .clearByAgent({ serverId: input.serverId, agentId: input.agentId });
     const session = useSessionStore.getState().sessions[input.serverId];
     const agent = session?.agents.get(input.agentId) ?? session?.agentDetails.get(input.agentId);
-    if (agent && agent.status !== "running") input.drainQueuedAgentMessage(input.agentId);
+    if (agent && agent.turn.phase === "idle") input.drainQueuedAgentMessage(input.agentId);
   }
   if (input.result.initResolution === "resolve") resolveInitDeferred(input.initKey);
 }

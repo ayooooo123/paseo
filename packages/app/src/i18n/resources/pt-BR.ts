@@ -923,11 +923,8 @@ export const ptBR: TranslationResources = {
         refresh: "Atualizar",
         refreshState: "Atualizar estado do git e do {{brand}}",
         failedRefresh: "Falha ao atualizar estado do git.",
-        emptyHiddenWhitespace: "Nenhuma alteração visível após ocultar espaços em branco",
-        emptyUncommitted: "Nenhuma alteração sem commit",
         seeUncommittedChanges: "Ver alterações sem commit",
         seeCommittedChanges: "Ver alterações com commit",
-        emptyAgainstBase: "Nenhuma alteração vs {{baseRef}}",
         checkingRepository: "Verificando repositório...",
         notRepository: "Não é um repositório git",
         diffMode: "Modo de diff",
@@ -1068,6 +1065,16 @@ export const ptBR: TranslationResources = {
       deleteMessage_other: "Isso remove a etiqueta de {{count}} workspaces neste host.",
       offline: "Este host está offline.",
       updateHost: "Atualize este host para gerenciar etiquetas.",
+    },
+  },
+  changelog: {
+    title: "Novidades",
+    installed: "Instalada",
+    showMore: "Mostrar mais",
+    openWebsite: "Changelog completo",
+    error: {
+      title: "Não foi possível carregar o changelog",
+      description: "Verifique sua conexão e tente novamente.",
     },
   },
   sidebar: {
@@ -2104,6 +2111,7 @@ export const ptBR: TranslationResources = {
     about: {
       title: "Sobre",
       appVersion: "Versão do app",
+      whatsNewHint: "Notas de versão de cada release",
       thisDevice: "Este dispositivo",
       connectedHosts: "Hosts conectados",
       offline: "Offline",

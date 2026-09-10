@@ -901,11 +901,8 @@ export const ar: TranslationResources = {
         refresh: "ينعش",
         refreshState: "تحديث حالة git و{{brand}}",
         failedRefresh: "فشل تحديث حالة git.",
-        emptyHiddenWhitespace: "لا توجد تغييرات مرئية بعد إخفاء المسافة البيضاء",
-        emptyUncommitted: "لا توجد تغييرات غير ملتزم بها",
         seeUncommittedChanges: "عرض التغييرات غير الملتزم بها",
         seeCommittedChanges: "عرض التغييرات الملتزم بها",
-        emptyAgainstBase: "لا توجد تغييرات مقابل{{baseRef}}",
         checkingRepository: "فحص المستودع...",
         notRepository: "ليس مستودع جيت",
         diffMode: "وضع الفرق",
@@ -1043,6 +1040,16 @@ export const ar: TranslationResources = {
       deleteMessage_other: "سيؤدي هذا إلى إزالة التسمية من {{count}} مساحات عمل على هذا المضيف.",
       offline: "هذا المضيف غير متصل.",
       updateHost: "حدّث هذا المضيف لإدارة التسميات.",
+    },
+  },
+  changelog: {
+    title: "ما الجديد",
+    installed: "مثبّت",
+    showMore: "عرض المزيد",
+    openWebsite: "سجل التغييرات الكامل",
+    error: {
+      title: "تعذّر تحميل سجل التغييرات",
+      description: "تحقق من اتصالك وحاول مرة أخرى.",
     },
   },
   sidebar: {
@@ -2070,6 +2077,7 @@ export const ar: TranslationResources = {
     about: {
       title: "عن",
       appVersion: "نسخة التطبيق",
+      whatsNewHint: "ملاحظات الإصدار لكل نسخة",
       thisDevice: "هذا الجهاز",
       connectedHosts: "المضيفين المتصلين",
       offline: "غير متصل",

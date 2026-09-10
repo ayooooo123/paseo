@@ -916,11 +916,8 @@ export const ru: TranslationResources = {
         refresh: "Обновить",
         refreshState: "Обновить состояние Git и {{brand}}",
         failedRefresh: "Не удалось обновить состояние Git.",
-        emptyHiddenWhitespace: "После скрытия пробельных изменений видимых изменений нет",
-        emptyUncommitted: "Нет незафиксированных изменений",
         seeUncommittedChanges: "Показать незафиксированные изменения",
         seeCommittedChanges: "Показать зафиксированные изменения",
-        emptyAgainstBase: "Нет изменений относительно {{baseRef}}",
         checkingRepository: "Проверяем репозиторий...",
         notRepository: "Это не репозиторий Git",
         diffMode: "Режим диффа",
@@ -1058,6 +1055,16 @@ export const ru: TranslationResources = {
       deleteMessage_other: "Метка будет снята с {{count}} рабочих пространств на этом хосте.",
       offline: "Этот хост не в сети.",
       updateHost: "Обновите этот хост для управления метками.",
+    },
+  },
+  changelog: {
+    title: "Что нового",
+    installed: "Установлена",
+    showMore: "Показать ещё",
+    openWebsite: "Полный список изменений",
+    error: {
+      title: "Не удалось загрузить список изменений",
+      description: "Проверьте подключение и попробуйте снова.",
     },
   },
   sidebar: {
@@ -2105,6 +2112,7 @@ export const ru: TranslationResources = {
     about: {
       title: "О приложении",
       appVersion: "Версия приложения",
+      whatsNewHint: "Заметки о выпуске для каждой версии",
       thisDevice: "Это устройство",
       connectedHosts: "Подключенные хосты",
       offline: "Оффлайн",
