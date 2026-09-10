@@ -47,12 +47,9 @@ async function readCachedSnapshot(
 }
 
 function canAdmitRangelessCache(
-  beforeHead: unknown,
-  currentHead: unknown,
   beforeTimeline: AgentTimelineState,
   currentTimeline: AgentTimelineState,
 ): boolean {
-  if (currentHead !== beforeHead) return false;
   if (beforeTimeline.status === "painted") {
     return currentTimeline.status === "painted" && currentTimeline.items === beforeTimeline.items;
   }
@@ -68,7 +65,6 @@ async function prepareCachedTimeline(input: {
   const before = useSessionStore.getState().sessions[input.serverId];
   const beforeTimeline = selectAgentTimelineState(before, input.agentId);
   if (beforeTimeline.status === "synced") return undefined;
-  const beforeHead = before?.agentStreamHead.get(input.agentId);
   const snapshot = await readCachedSnapshot(input.storage, input.serverId, input.agentId);
   await input.prepareAgent(input.agentId, snapshot.agent);
   const stored = snapshot.timeline;
@@ -77,10 +73,7 @@ async function prepareCachedTimeline(input: {
   const currentTimeline = selectAgentTimelineState(session, input.agentId);
   const currentHead = session?.agentStreamHead.get(input.agentId);
   if (currentTimeline.status === "synced") return undefined;
-  if (
-    !stored.range &&
-    !canAdmitRangelessCache(beforeHead, currentHead, beforeTimeline, currentTimeline)
-  ) {
+  if (!stored.range && !canAdmitRangelessCache(beforeTimeline, currentTimeline)) {
     return undefined;
   }
   const liveItems =
