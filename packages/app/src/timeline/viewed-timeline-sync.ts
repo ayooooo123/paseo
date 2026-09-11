@@ -580,11 +580,16 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     generation: number,
     request: ProjectedTimelineForwardFetchPlan,
     fallbackToLatestTailOnOverflow: boolean,
+    // COMPAT(timelineSubscribeAndFetch): the combined bootstrap RPC already returned this
+    // request's page. Seeding it here keeps the resume on the ordinary catch-up path — same
+    // overflow fallback, retry, and error handling — without re-fetching a page the daemon
+    // already sent. Remove after 2027-03-01.
+    seedPage?: TimelinePageResult,
   ): Promise<void> => {
     if (!ownsCatchUp(agentId, generation)) return;
 
     try {
-      const page = await ports.fetchPage(agentId, request);
+      const page = seedPage ?? (await ports.fetchPage(agentId, request));
       if (!ownsCatchUp(agentId, generation)) return;
       if (page.hasNewer && page.endCursor) {
         if (fallbackToLatestTailOnOverflow) {
@@ -706,12 +711,28 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     }
   };
 
-  const acceptSubscriptionBootstrap = (bootstrap: TimelineSubscriptionBootstrapResult): void => {
+  const acceptSubscriptionBootstrap = (
+    bootstrap: TimelineSubscriptionBootstrapResult,
+    request: ProjectedTimelineForwardFetchPlan,
+  ): void => {
     const catchUpGeneration = (catchUpGenerations.get(bootstrap.agentId) ?? 0) + 1;
     catchUpGenerations.set(bootstrap.agentId, catchUpGeneration);
     if (bootstrap.page.hasNewer) {
       if (!bootstrap.page.endCursor) {
         throw new Error(`Timeline page for ${bootstrap.agentId} hasNewer without an end cursor`);
+      }
+      // A resume that overflows owes the same single latest-tail replacement an ordinary
+      // catch-up would perform, so hand the page back to the catch-up path instead of parking
+      // a plain continuation that would leave the pre-disconnect history mounted.
+      if (request.direction === "after") {
+        catchUps.set(bootstrap.agentId, {
+          generation: catchUpGeneration,
+          status: "running",
+          request,
+        });
+        pendingCatchUps.delete(bootstrap.agentId);
+        void fetchUntilCurrent(bootstrap.agentId, catchUpGeneration, request, true, bootstrap.page);
+        return;
       }
       pendingCatchUps.set(bootstrap.agentId, planTimelineCatchUpAfter(bootstrap.page.endCursor));
       return;
@@ -734,6 +755,19 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     const requested = desired;
     if (!membershipNeedsRetry && sameAgentIds(requested, acknowledged)) return;
     membershipNeedsRetry = false;
+    const failMembership = (error: unknown): void => {
+      membershipNeedsRetry = true;
+      setVisibilityCatchUpError(requested, error);
+      cancelMembershipRetry?.();
+      const nextRetryDelayMs = getNextRetryDelayMs(membershipRetryDelayMs);
+      cancelMembershipRetry = ports.schedule(() => {
+        cancelMembershipRetry = null;
+        if (!ownsMembershipRequest(generation, requested)) return;
+        void reconcileMembership();
+      }, nextRetryDelayMs);
+      membershipRetryDelayMs = nextRetryDelayMs;
+      ports.reportError(error);
+    };
     try {
       const bootstrapAgentId = visibleAgentIds().find((agentId) => requested.includes(agentId));
       if (bootstrapAgentId) await ensureCacheLoaded(bootstrapAgentId);
@@ -746,28 +780,21 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
           ? { agentId: bootstrapAgentId, request: bootstrapRequest }
           : undefined,
       );
-      if (bootstrap && ownsMembershipRequest(generation, requested)) {
-        acceptSubscriptionBootstrap(bootstrap);
+      cancelMembershipRetry?.();
+      cancelMembershipRetry = null;
+      membershipRetryDelayMs = undefined;
+      if (!isSelectiveMembershipActive()) return;
+      acknowledged = requested;
+      // Acceptance runs after acknowledgement because a seeded resume catch-up goes through
+      // `ownsCatchUp`, which requires the agent to be acknowledged. It stays inside this try so
+      // a malformed bootstrap page fails the membership instead of rejecting unhandled.
+      if (bootstrap && bootstrapRequest && ownsMembershipRequest(generation, requested)) {
+        acceptSubscriptionBootstrap(bootstrap, bootstrapRequest);
       }
     } catch (error) {
-      membershipNeedsRetry = true;
-      setVisibilityCatchUpError(requested, error);
-      cancelMembershipRetry?.();
-      const nextRetryDelayMs = getNextRetryDelayMs(membershipRetryDelayMs);
-      cancelMembershipRetry = ports.schedule(() => {
-        cancelMembershipRetry = null;
-        if (!ownsMembershipRequest(generation, requested)) return;
-        void reconcileMembership();
-      }, nextRetryDelayMs);
-      membershipRetryDelayMs = nextRetryDelayMs;
-      ports.reportError(error);
+      failMembership(error);
       return;
     }
-    cancelMembershipRetry?.();
-    cancelMembershipRetry = null;
-    membershipRetryDelayMs = undefined;
-    if (!isSelectiveMembershipActive()) return;
-    acknowledged = requested;
     if (generation !== membershipGeneration) {
       await reconcileLatestMembership();
       return;

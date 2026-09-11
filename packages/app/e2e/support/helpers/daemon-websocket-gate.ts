@@ -1,4 +1,9 @@
 import type { Page, WebSocketRoute } from "@playwright/test";
+import {
+  asTimelineFetchRequest,
+  asTimelineFetchResponsePayload,
+  isTimelineFetchResponse,
+} from "./timeline-rpc-compat";
 import { daemonWsRoutePattern } from "./daemon-port";
 
 export interface DirectoryBootstrapCounts {
@@ -120,13 +125,21 @@ function stripCanonicalSubmittedPrompts(
   return JSON.stringify(envelope);
 }
 
+// COMPAT(timelineSubscribeAndFetch): a combined bootstrap response nests the fetch payload under
+// `timeline`, so rewriters have to edit that inner object rather than the envelope payload.
+function timelinePayloadOf(payload: Record<string, unknown> | undefined) {
+  if (!payload) return undefined;
+  const nested = payload.timeline;
+  return nested && typeof nested === "object" ? (nested as Record<string, unknown>) : payload;
+}
+
 function forceTimelineReset(message: string | Buffer, enabled: boolean): string | Buffer {
   if (!enabled || typeof message !== "string") return message;
   const envelope = JSON.parse(message) as {
     message?: { payload?: Record<string, unknown> };
     payload?: Record<string, unknown>;
   };
-  const payload = envelope.message?.payload ?? envelope.payload;
+  const payload = timelinePayloadOf(envelope.message?.payload ?? envelope.payload);
   if (!payload) return message;
   payload.epoch = `playwright-reset-${Date.now()}`;
   payload.reset = true;
@@ -143,7 +156,7 @@ function failTimelineResponse(message: string | Buffer, agentId: string | null):
     message?: { payload?: Record<string, unknown> };
     payload?: Record<string, unknown>;
   };
-  const payload = envelope.message?.payload ?? envelope.payload;
+  const payload = timelinePayloadOf(envelope.message?.payload ?? envelope.payload);
   if (!payload || payload.agentId !== agentId) return message;
   payload.error = TIMELINE_WRITER_CONFLICT_ERROR;
   payload.entries = [];
@@ -280,10 +293,11 @@ function recordClientRequest(
 ): void {
   if (typeof request?.type !== "string") return;
   clientRequestCounts.set(request.type, (clientRequestCounts.get(request.type) ?? 0) + 1);
-  if (request.type === "fetch_agent_timeline_request" && typeof request.direction === "string") {
+  const timelineRequest = asTimelineFetchRequest(request);
+  if (timelineRequest && typeof timelineRequest.direction === "string") {
     timelineRequestCounts.set(
-      request.direction,
-      (timelineRequestCounts.get(request.direction) ?? 0) + 1,
+      timelineRequest.direction,
+      (timelineRequestCounts.get(timelineRequest.direction) ?? 0) + 1,
     );
   }
   const directory = directoryForRequest(request);
@@ -361,8 +375,15 @@ export async function installDaemonWebSocketGate(page: Page) {
     const messageType = typeof message?.type === "string" ? message.type : null;
     const itemType = readAgentStreamItemType(message);
     const eventType = readAgentStreamEventType(message);
-    if (messageType)
+    if (messageType) {
       serverMessageCounts.set(messageType, (serverMessageCounts.get(messageType) ?? 0) + 1);
+      // COMPAT(timelineSubscribeAndFetch): a caller waiting on "fetch_agent_timeline_response"
+      // is waiting for a timeline page, which this fork may deliver as the combined response.
+      if (messageType === "agent.timeline.subscribe_and_fetch.response") {
+        const alias = "fetch_agent_timeline_response";
+        serverMessageCounts.set(alias, (serverMessageCounts.get(alias) ?? 0) + 1);
+      }
+    }
     if (itemType)
       agentStreamItemCounts.set(itemType, (agentStreamItemCounts.get(itemType) ?? 0) + 1);
     if (eventType)
@@ -514,17 +535,16 @@ export async function installDaemonWebSocketGate(page: Page) {
         stripCanonicalSubmittedPromptsFeature,
         serverMessage?.type,
       );
-      const isTimelineResponse = serverMessage?.type === "fetch_agent_timeline_response";
+      const isTimelineResponse = isTimelineFetchResponse(serverMessage?.type);
       if (isTimelineResponse) {
         outboundMessage = failTimelineResponse(outboundMessage, failingTimelineAgentId);
       }
-      const shouldForceTimelineReset =
-        forceTimelineEpochReset && serverMessage?.type === "fetch_agent_timeline_response";
+      const shouldForceTimelineReset = forceTimelineEpochReset && isTimelineResponse;
       outboundMessage = forceTimelineReset(outboundMessage, shouldForceTimelineReset);
       if (shouldForceTimelineReset) forceTimelineEpochReset = false;
       recordServerMessage(serverMessage);
       if (isTimelineResponse && holdingTimelineAgentId) {
-        const payload = (serverMessage as { payload?: { agentId?: unknown } } | null)?.payload;
+        const payload = asTimelineFetchResponsePayload(serverMessage, serverMessage?.payload);
         if (payload?.agentId === holdingTimelineAgentId) {
           const forward = outboundMessage;
           heldTimelineResponses.push(() => ws.send(forward));
@@ -645,8 +665,14 @@ export async function installDaemonWebSocketGate(page: Page) {
       heldClientRequestType = null;
     },
     holdNextServerMessage(type: string): void {
+      // COMPAT(timelineSubscribeAndFetch): a caller holding "fetch_agent_timeline_response" wants
+      // the next timeline page, which this fork may deliver as the combined bootstrap response.
+      const matchesType =
+        type === "fetch_agent_timeline_response"
+          ? (messageType: unknown) => isTimelineFetchResponse(messageType)
+          : (messageType: unknown) => messageType === type;
       pendingServerMessageHolds.set(serverMessageKey(type), {
-        matches: (message) => message?.type === type,
+        matches: (message) => matchesType(message?.type),
       });
     },
     holdNextAgentUpdate(agentId: string, status: string): void {
@@ -760,9 +786,13 @@ export async function installDaemonWebSocketGate(page: Page) {
       const heldServerMessage = heldServerMessages[0];
       if (!heldServerMessage) throw new Error("No held server message to inspect");
       const response = readSessionMessage(heldServerMessage.message);
-      const payload = response?.payload;
-      if (!payload || typeof payload !== "object") return null;
-      const entries = (payload as { entries?: unknown }).entries;
+      const payload = timelinePayloadOf(
+        response?.payload && typeof response.payload === "object"
+          ? (response.payload as Record<string, unknown>)
+          : undefined,
+      );
+      if (!payload) return null;
+      const entries = payload.entries;
       if (!Array.isArray(entries)) return null;
       const last = entries.at(-1) as { item?: { type?: unknown } } | undefined;
       return typeof last?.item?.type === "string" ? last.item.type : null;
@@ -776,7 +806,7 @@ export async function installDaemonWebSocketGate(page: Page) {
         message?: { payload?: Record<string, unknown> };
         payload?: Record<string, unknown>;
       };
-      const payload = envelope.message?.payload ?? envelope.payload;
+      const payload = timelinePayloadOf(envelope.message?.payload ?? envelope.payload);
       if (!payload) throw new Error("Held message has no payload");
       const entries = payload.entries;
       if (!Array.isArray(entries)) throw new Error("Held message is not a timeline response");

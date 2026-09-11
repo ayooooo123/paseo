@@ -1,5 +1,10 @@
 import type { Page } from "@playwright/test";
 import { daemonWsRoutePattern, wsRoutePatternForPort } from "./daemon-port";
+import {
+  asTimelineCursor,
+  asTimelineFetchRequest,
+  asTimelineFetchResponsePayload,
+} from "./timeline-rpc-compat";
 
 type WebSocketMessage = string | Buffer;
 
@@ -66,23 +71,11 @@ export async function trackAgentTimelineRequests(
     const server = ws.connectToServer();
     ws.onMessage((message) => {
       const sessionMessage = getSessionMessage(message);
-      if (
-        sessionMessage?.type === "fetch_agent_timeline_request" &&
-        sessionMessage.agentId === agentId
-      ) {
-        const rawCursor = sessionMessage.cursor;
-        const cursor =
-          rawCursor &&
-          typeof rawCursor === "object" &&
-          typeof (rawCursor as { epoch?: unknown }).epoch === "string" &&
-          typeof (rawCursor as { seq?: unknown }).seq === "number"
-            ? {
-                epoch: (rawCursor as { epoch: string }).epoch,
-                seq: (rawCursor as { seq: number }).seq,
-              }
-            : null;
+      const fetchRequest = asTimelineFetchRequest(sessionMessage);
+      if (fetchRequest && fetchRequest.agentId === agentId) {
+        const cursor = asTimelineCursor(fetchRequest.cursor);
         const request = {
-          direction: typeof sessionMessage.direction === "string" ? sessionMessage.direction : null,
+          direction: typeof fetchRequest.direction === "string" ? fetchRequest.direction : null,
           cursor,
         };
         seen.push(request);
@@ -93,10 +86,8 @@ export async function trackAgentTimelineRequests(
     server.onMessage((message) => {
       const sessionMessage = getSessionMessage(message);
       const payload = sessionMessage ? getPayload(sessionMessage) : null;
-      if (
-        sessionMessage?.type === "fetch_agent_timeline_response" &&
-        payload?.agentId === agentId
-      ) {
+      const fetchPayload = asTimelineFetchResponsePayload(sessionMessage, payload);
+      if (fetchPayload?.agentId === agentId) {
         responseSeen = true;
         resolveResponse?.();
       }
@@ -360,9 +351,10 @@ export async function delayCreatedAgentInitialTailResponse(
         }
       }
 
-      if (sessionMessage?.type === "fetch_agent_timeline_response") {
-        const agentId = payload?.agentId;
-        const direction = payload?.direction;
+      const timelinePayload = asTimelineFetchResponsePayload(sessionMessage, payload);
+      if (timelinePayload) {
+        const agentId = timelinePayload.agentId;
+        const direction = timelinePayload.direction;
         if (
           !delayedResponseSeen &&
           typeof agentId === "string" &&
@@ -445,20 +437,16 @@ export async function holdAgentOlderTimelinePages(
     server.onMessage((message) => {
       const sessionMessage = getSessionMessage(message);
       const payload = sessionMessage ? getPayload(sessionMessage) : null;
+      const timelinePayload = asTimelineFetchResponsePayload(sessionMessage, payload);
       if (
-        sessionMessage?.type === "fetch_agent_timeline_response" &&
-        payload?.agentId === agentId &&
-        (payload.direction === "tail" || payload.direction === "before")
+        timelinePayload?.agentId === agentId &&
+        (timelinePayload.direction === "tail" || timelinePayload.direction === "before")
       ) {
-        recordOwnedTimelineEntries(payload, ownedEntries);
+        recordOwnedTimelineEntries(timelinePayload, ownedEntries);
       }
-      if (
-        sessionMessage?.type === "fetch_agent_timeline_response" &&
-        payload?.agentId === agentId &&
-        payload.direction === "before"
-      ) {
+      if (timelinePayload?.agentId === agentId && timelinePayload.direction === "before") {
         responseCount += 1;
-        repeatedEntryCount += recordRepeatedTimelineEntries(payload, entryKeys);
+        repeatedEntryCount += recordRepeatedTimelineEntries(timelinePayload, entryKeys);
         const pageNumber = responseCount;
         if (releasedPages.has(pageNumber)) {
           ws.send(message);
@@ -517,15 +505,15 @@ export async function delayAgentBootstrapTailResponse(
     server.onMessage((message) => {
       const sessionMessage = getSessionMessage(message);
       const payload = sessionMessage ? getPayload(sessionMessage) : null;
-      const isTimelineResponse =
-        sessionMessage?.type === "fetch_agent_timeline_response" && payload?.agentId === agentId;
-      if (isTimelineResponse && payload.direction === "tail") {
+      const timelinePayload = asTimelineFetchResponsePayload(sessionMessage, payload);
+      const isTimelineResponse = timelinePayload?.agentId === agentId;
+      if (isTimelineResponse && timelinePayload.direction === "tail") {
         resolveDelayedTail?.();
         if (tailReleased) ws.send(message);
         else delayedTailForwards.push(() => ws.send(message));
         return;
       }
-      if (isTimelineResponse && payload.direction === "after") {
+      if (isTimelineResponse && timelinePayload.direction === "after") {
         resolveDelayedCatchUp?.();
         if (catchUpReleased) ws.send(message);
         else delayedCatchUpForwards.push(() => ws.send(message));
@@ -570,11 +558,11 @@ async function delayAgentTimelineResponse(
     server.onMessage((message) => {
       const sessionMessage = getSessionMessage(message);
       const payload = sessionMessage ? getPayload(sessionMessage) : null;
+      const timelinePayload = asTimelineFetchResponsePayload(sessionMessage, payload);
       if (
         !delayedResponseSeen &&
-        sessionMessage?.type === "fetch_agent_timeline_response" &&
-        payload?.agentId === agentId &&
-        payload.direction === direction
+        timelinePayload?.agentId === agentId &&
+        timelinePayload.direction === direction
       ) {
         delayedResponseSeen = true;
         resolveDelayedResponse?.();

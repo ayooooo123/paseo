@@ -1,4 +1,5 @@
 import { expect, type Page } from "@playwright/test";
+import { isTimelineSubscriptionResponse } from "./timeline-rpc-compat";
 
 type WebSocketMessage = string | Buffer;
 
@@ -30,9 +31,10 @@ export function observeTimelineSubscriptions(page: Page) {
   page.on("websocket", (socket) => {
     socket.on("framereceived", ({ payload }) => {
       const message = readSessionMessage(payload);
-      if (message?.type !== "agent.timeline.set_subscription.response") return;
-      const response = message.payload as { agentIds?: unknown } | undefined;
-      if (!Array.isArray(response?.agentIds)) return;
+      if (!isTimelineSubscriptionResponse(message?.type)) return;
+      const response = message?.payload;
+      if (!response || typeof response !== "object" || !("agentIds" in response)) return;
+      if (!Array.isArray(response.agentIds)) return;
       acknowledgedAgentIds = response.agentIds.filter(
         (agentId): agentId is string => typeof agentId === "string",
       );

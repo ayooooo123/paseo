@@ -440,16 +440,55 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
           bootstrap &&
           client.getLastServerInfoMessage()?.features?.timelineSubscribeAndFetch === true
         ) {
-          const payload = await client.subscribeAndFetchAgentTimeline(
-            agentIds,
-            bootstrap.agentId,
-            bootstrap.request,
-          );
-          applyTimelineResponse(payload);
-          return {
-            agentId: bootstrap.agentId,
-            page: { hasNewer: payload.hasNewer, endCursor: payload.endCursor },
-          };
+          // The combined RPC replaces the bootstrap `fetchPage` call, so it has to register the
+          // same initialization state. `processTimelineResponse` decides whether a page is the
+          // authoritative initial page from `isInitializing`/`hasActiveInitDeferred`; without
+          // them the bootstrap page commits no history range and older pages stay unreachable.
+          const bootstrapAgentId = bootstrap.agentId;
+          const initKey = getInitKey(serverId, bootstrapAgentId);
+          const session = useSessionStore.getState().sessions[serverId];
+          const shouldInitialize =
+            selectAgentTimelineState(session, bootstrapAgentId).status !== "synced";
+          if (shouldInitialize) {
+            if (!getInitDeferred(initKey)) {
+              const deferred = createInitDeferred(initKey, bootstrap.request.direction ?? "tail");
+              void deferred.promise.catch(() => undefined);
+            }
+            refreshAgentInitializationTimeout({
+              key: initKey,
+              agentId: bootstrapAgentId,
+              setAgentInitializing,
+            });
+            setAgentInitializing(bootstrapAgentId, true);
+          }
+          try {
+            const payload = await client.subscribeAndFetchAgentTimeline(
+              agentIds,
+              bootstrapAgentId,
+              bootstrap.request,
+            );
+            applyTimelineResponse(payload);
+            if (shouldInitialize && getInitDeferred(initKey)) {
+              refreshAgentInitializationTimeout({
+                key: initKey,
+                agentId: bootstrapAgentId,
+                setAgentInitializing,
+              });
+            }
+            return {
+              agentId: bootstrapAgentId,
+              page: { hasNewer: payload.hasNewer, endCursor: payload.endCursor },
+            };
+          } catch (error) {
+            if (shouldInitialize) {
+              setAgentInitializing(bootstrapAgentId, false);
+              rejectInitDeferred(
+                initKey,
+                error instanceof Error ? error : new Error(String(error)),
+              );
+            }
+            throw error;
+          }
         }
         await client.setAgentTimelineSubscription(agentIds);
         return undefined;

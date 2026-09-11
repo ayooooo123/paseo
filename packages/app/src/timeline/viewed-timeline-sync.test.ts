@@ -307,6 +307,33 @@ test("continues after a subscription bootstrap that reports newer history", asyn
   await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
 });
 
+// COMPAT(timelineSubscribeAndFetch): a resume folded into the combined bootstrap RPC owes the
+// same single latest-tail replacement an ordinary catch-up performs. Without it the
+// pre-disconnect page stays mounted. Remove alongside the shim after 2027-03-01.
+test("falls back to one latest tail when a resume bootstrap overflows", async () => {
+  const world = new TimelineWorld();
+  world.cursors.set("agent-a", { epoch: "epoch-agent-a", endSeq: 4 });
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+
+  const membership = await world.nextMembership();
+  expect(membership.bootstrap?.request.direction).toBe("after");
+  membership.succeed({
+    agentId: "agent-a",
+    page: { hasNewer: true, endCursor: { epoch: "epoch-agent-a", seq: 7 } },
+  });
+
+  const tail = await world.nextFetch("agent-a");
+  expect(tail.request.direction).toBe("tail");
+  expect(world.forcedTimelineTailReplacements.has("agent-a")).toBe(true);
+  tail.respond({ hasNewer: false });
+
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+  // `nextFetch` consumes the queue, so the tail above is the only fetch the resume produced:
+  // no extra "after" page was requested before it and none follows.
+  world.expectNoPendingFetch();
+});
+
 test("ignores a stale subscription bootstrap after visible membership changes", async () => {
   const world = new TimelineWorld();
   world.sync.setConnected(true);
