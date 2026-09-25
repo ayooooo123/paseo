@@ -9,8 +9,8 @@ import {
   type PressableStateCallbackType,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { memo, useCallback, useMemo, useState, type ReactElement } from "react";
-import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { useCallback, useMemo, useState, type ReactElement } from "react";
+import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { useIsCompactFormFactor } from "@/constants/layout";
@@ -18,14 +18,12 @@ import { formatTimeAgo } from "@/utils/time";
 import { type AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { useSessionStore } from "@/stores/session-store";
 import { Archive, ChevronRight } from "lucide-react-native";
-import { ICON_SIZE, SPACING, type Theme } from "@/styles/theme";
 import { getProviderIcon } from "@/components/provider-icons";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { useArchiveAgent } from "@/hooks/use-archive-agent";
 import { HighlightedText } from "@/components/ui/highlighted-text";
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/status-badge";
-import type { AgentSearchMatch } from "@getpaseo/protocol/messages";
-import type { MatchRange } from "@getpaseo/protocol/search/text-match";
+import { findHighlightRanges } from "@/components/ui/highlighted-text-segments";
 
 interface AgentListProps {
   agents: AggregatedAgent[];
@@ -37,22 +35,8 @@ interface AgentListProps {
   listFooterComponent?: ReactElement | null;
   showAttentionIndicator?: boolean;
   showHostColumn?: boolean;
-  /**
-   * Where a search matched each row, keyed by `serverId:agentId`. Rows mark the
-   * spans so the list can explain why a result is in it — the subsequence and
-   * typo tiers match characters the eye would not find on its own.
-   */
-  searchMatchesByAgentKey?: Record<string, AgentSearchMatch[]>;
-  /**
-   * Renders one flat list in the given order instead of grouping by day. Day
-   * headings claim the list is chronological, which is a lie once the caller
-   * has ordered it by something else — relevance, for instance.
-   */
-  flat?: boolean;
+  search?: string;
 }
-
-/** Spacing lives in the string because the meta line is one `Text`, not a flex row. */
-const META_SEPARATOR = " · ";
 
 type DateSectionKey = "today" | "yesterday" | "thisWeek" | "thisMonth" | "older";
 
@@ -111,14 +95,6 @@ function formatDateSectionLabel(t: TFunction, section: DateSectionKey): string {
   }
 }
 
-const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
-const ThemedArchive = withUnistyles(Archive, mutedIconMapping);
-const ThemedChevronRight = withUnistyles(ChevronRight, mutedIconMapping);
-const ThemedRefreshControl = withUnistyles(RefreshControl, (theme: Theme) => ({
-  tintColor: theme.colors.foregroundMuted,
-  colors: [theme.colors.foregroundMuted],
-}));
-
 function SessionBadge({
   label,
   icon,
@@ -134,48 +110,18 @@ function SessionBadge({
   return <StatusBadge label={label} variant={variant} leading={icon} />;
 }
 
-function WorkspaceTitlePrefix({
-  visible,
-  workspaceName,
-  ranges,
-  testID,
-}: {
-  visible: boolean;
-  workspaceName: string;
-  ranges?: readonly MatchRange[];
-  testID: string;
-}) {
-  if (!visible) {
-    return null;
-  }
-
-  return (
-    <>
-      <HighlightedText
-        text={workspaceName}
-        ranges={ranges}
-        style={styles.workspaceTitleText}
-        numberOfLines={1}
-        testID={testID}
-      />
-      <ThemedChevronRight size={ICON_SIZE.xs} />
-    </>
-  );
-}
-
 function SessionRowBadges({
   agent,
+  archivedIcon,
   pendingPermissionCount,
   showDesktopAttention,
 }: {
   agent: AggregatedAgent;
+  archivedIcon: ReactElement;
   pendingPermissionCount: number;
   showDesktopAttention: boolean;
 }) {
   const { t } = useTranslation();
-  // `[]` is honest here: `ThemedArchive` re-renders itself on a theme change, so the element
-  // never has to be rebuilt.
-  const archivedIcon = useMemo(() => <ThemedArchive size={ICON_SIZE.xs} />, []);
   return (
     <>
       {agent.archivedAt ? (
@@ -214,9 +160,9 @@ function SessionRowTrailingAttention({
   );
 }
 
-const SessionRow = memo(function SessionRow({
+function SessionRow({
   agent,
-  searchMatches,
+  search,
   isMobile,
   selectedAgentId,
   showAttentionIndicator,
@@ -225,7 +171,7 @@ const SessionRow = memo(function SessionRow({
   onLongPress,
 }: {
   agent: AggregatedAgent;
-  searchMatches?: readonly AgentSearchMatch[];
+  search?: string;
   isMobile: boolean;
   selectedAgentId?: string;
   showAttentionIndicator: boolean;
@@ -233,6 +179,7 @@ const SessionRow = memo(function SessionRow({
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
 }) {
+  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const timeAgo = formatTimeAgo(agent.lastActivityAt);
   const agentKey = `${agent.serverId}:${agent.id}`;
@@ -242,10 +189,14 @@ const SessionRow = memo(function SessionRow({
   const workspaceName = agent.projectPlacement?.workspaceName ?? "";
   const ProviderIcon = getProviderIcon(agent.provider, agent.serverId);
   const pendingPermissionCount = agent.pendingPermissionCount ?? 0;
-  const rangesFor = useCallback(
-    (field: AgentSearchMatch["field"]) =>
-      searchMatches?.find((match) => match.field === field)?.ranges,
-    [searchMatches],
+  const ranges = useMemo(
+    () => ({
+      workspace: findHighlightRanges(search ?? "", workspaceName),
+      title: findHighlightRanges(search ?? "", agent.title ?? ""),
+      branch: findHighlightRanges(search ?? "", branch),
+      project: findHighlightRanges(search ?? "", projectName),
+    }),
+    [search, workspaceName, agent.title, branch, projectName],
   );
 
   const pressableStyle = useCallback(
@@ -261,83 +212,94 @@ const SessionRow = memo(function SessionRow({
   const handlePress = useCallback(() => onPress(agent), [onPress, agent]);
   const handleLongPress = useCallback(() => onLongPress(agent), [onLongPress, agent]);
 
-  const sessionTitleStyle = useMemo(
-    () => [styles.sessionTitle, isSelected && styles.sessionTitleHighlighted],
-    [isSelected],
+  const archivedIcon = useMemo(
+    () => <Archive size={theme.fontSize.sm} color={theme.colors.foregroundMuted} />,
+    [theme.fontSize.sm, theme.colors.foregroundMuted],
   );
-
   const showDesktopAttention =
     !isMobile && showAttentionIndicator && Boolean(agent.requiresAttention);
+
+  const agentTitle = (
+    <View style={styles.agentTitleRow}>
+      <View style={styles.providerIconWrap}>
+        <ProviderIcon size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+      </View>
+      <HighlightedText
+        text={agent.title || t("agentList.fallbackTitle")}
+        ranges={ranges.title}
+        style={styles.sessionTitle}
+        numberOfLines={1}
+        testID={`agent-row-title-${agent.serverId}-${agent.id}`}
+      />
+    </View>
+  );
 
   return (
     <Pressable
       style={pressableStyle}
       onPress={handlePress}
       onLongPress={handleLongPress}
+      accessibilityRole="button"
       testID={`agent-row-${agent.serverId}-${agent.id}`}
     >
       <View style={styles.rowContent}>
         <View style={styles.rowTitleRow}>
-          <WorkspaceTitlePrefix
-            visible={!isMobile && Boolean(workspaceName)}
-            workspaceName={workspaceName}
-            ranges={rangesFor("workspace")}
+          <HighlightedText
+            text={workspaceName || projectName}
+            ranges={workspaceName ? ranges.workspace : ranges.project}
+            style={styles.workspaceTitleText}
+            numberOfLines={1}
             testID={`agent-row-workspace-${agent.serverId}-${agent.id}`}
           />
-          <View style={styles.providerIconWrap}>
-            <ProviderIcon size={ICON_SIZE.sm} color={styles.mutedIcon.color} />
-          </View>
-          <HighlightedText
-            text={agent.title || t("agentList.fallbackTitle")}
-            ranges={agent.title ? rangesFor("title") : undefined}
-            style={sessionTitleStyle}
-            numberOfLines={1}
-          />
+          {!isMobile ? (
+            <>
+              <ChevronRight size={theme.iconSize.xs} color={theme.colors.foregroundMuted} />
+              {agentTitle}
+            </>
+          ) : null}
           <SessionRowBadges
             agent={agent}
+            archivedIcon={archivedIcon}
             pendingPermissionCount={pendingPermissionCount}
             showDesktopAttention={showDesktopAttention}
           />
         </View>
+        {isMobile ? agentTitle : null}
         {isMobile ? (
-          // One `Text` with virtual children, not a flex row of seven. Nested `Text` never
-          // becomes a host view, so this is the difference between ~12 and ~6 native views per
-          // row — the cost that decides whether a flick keeps up. It also cannot wrap to a
-          // second line, so every row in the list is the same height.
-          <Text style={styles.sessionMetaText} numberOfLines={1}>
+          <View style={styles.rowMetaRow}>
             <HighlightedText
               text={projectName}
-              ranges={rangesFor("project")}
+              ranges={ranges.project}
+              style={styles.sessionMetaText}
+              numberOfLines={1}
               testID={`agent-row-project-${agent.serverId}-${agent.id}`}
             />
-            <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
+            <Text style={styles.sessionMetaSeparator}>·</Text>
             <HighlightedText
               text={branch}
-              ranges={rangesFor("branch")}
+              ranges={ranges.branch}
+              style={styles.sessionMetaText}
+              numberOfLines={1}
               testID={`agent-row-branch-${agent.serverId}-${agent.id}`}
             />
-            <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
-            <HighlightedText
-              text={workspaceName}
-              ranges={rangesFor("workspace")}
-              testID={`agent-row-workspace-${agent.serverId}-${agent.id}`}
-            />
-            <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
-            {timeAgo}
+            <Text style={styles.sessionMetaSeparator}>·</Text>
+            <Text style={styles.sessionMetaText}>{timeAgo}</Text>
             {showHostColumn && agent.serverLabel ? (
               <>
-                <Text style={styles.sessionMetaSeparator}>{META_SEPARATOR}</Text>
-                {agent.serverLabel}
+                <Text style={styles.sessionMetaSeparator}>·</Text>
+                <Text style={styles.sessionMetaText} numberOfLines={1}>
+                  {agent.serverLabel}
+                </Text>
               </>
             ) : null}
-          </Text>
+          </View>
         ) : null}
       </View>
       {!isMobile ? (
         <View style={styles.rowColumns}>
           <HighlightedText
             text={projectName}
-            ranges={rangesFor("project")}
+            ranges={ranges.project}
             style={styles.columnMeta}
             numberOfLines={1}
             testID={`agent-row-project-${agent.serverId}-${agent.id}`}
@@ -349,7 +311,7 @@ const SessionRow = memo(function SessionRow({
           ) : null}
           <HighlightedText
             text={branch}
-            ranges={rangesFor("branch")}
+            ranges={ranges.branch}
             style={styles.columnMeta}
             numberOfLines={1}
             testID={`agent-row-branch-${agent.serverId}-${agent.id}`}
@@ -366,7 +328,7 @@ const SessionRow = memo(function SessionRow({
       />
     </Pressable>
   );
-});
+}
 
 export function AgentList({
   agents,
@@ -377,9 +339,9 @@ export function AgentList({
   listFooterComponent,
   showAttentionIndicator = true,
   showHostColumn = false,
-  searchMatchesByAgentKey,
-  flat = false,
+  search,
 }: AgentListProps) {
+  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const [actionAgent, setActionAgent] = useState<AggregatedAgent | null>(null);
@@ -445,14 +407,6 @@ export function AgentList({
   }, [actionAgent, actionClient, archiveAgent]);
 
   const flatItems = useMemo((): FlatListItem[] => {
-    if (flat) {
-      return agents.map((agent) => ({
-        type: "agent" as const,
-        key: `${agent.serverId}:${agent.id}`,
-        agent,
-      }));
-    }
-
     const buckets = new Map<DateSectionKey, AggregatedAgent[]>();
     for (const agent of agents) {
       const section = deriveDateSectionKey(agent.lastActivityAt);
@@ -473,7 +427,7 @@ export function AgentList({
       }
     }
     return result;
-  }, [agents, flat]);
+  }, [agents]);
 
   const renderItem: ListRenderItem<FlatListItem> = useCallback(
     ({ item }) => {
@@ -487,7 +441,7 @@ export function AgentList({
       return (
         <SessionRow
           agent={item.agent}
-          searchMatches={searchMatchesByAgentKey?.[item.key]}
+          search={search}
           isMobile={isMobile}
           selectedAgentId={selectedAgentId}
           showAttentionIndicator={showAttentionIndicator}
@@ -501,7 +455,7 @@ export function AgentList({
       handleAgentLongPress,
       handleAgentPress,
       isMobile,
-      searchMatchesByAgentKey,
+      search,
       selectedAgentId,
       showAttentionIndicator,
       showHostColumn,
@@ -511,9 +465,13 @@ export function AgentList({
 
   const keyExtractor = useCallback((item: FlatListItem) => item.key, []);
 
+  const refreshColors = useMemo(
+    () => [theme.colors.foregroundMuted],
+    [theme.colors.foregroundMuted],
+  );
   const sheetContainerStyle = useMemo(
-    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, SPACING[6]) }],
-    [insets.bottom],
+    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, theme.spacing[6]) }],
+    [insets.bottom, theme.spacing],
   );
   const sheetArchiveTextStyle = useMemo(
     () => [styles.sheetArchiveText, isActionDaemonUnavailable && styles.sheetArchiveTextDisabled],
@@ -523,9 +481,14 @@ export function AgentList({
   const refreshControl = useMemo(
     () =>
       onRefresh ? (
-        <ThemedRefreshControl refreshing={isRefreshing} onRefresh={onRefresh} />
+        <RefreshControl
+          refreshing={isRefreshing}
+          onRefresh={onRefresh}
+          tintColor={theme.colors.foregroundMuted}
+          colors={refreshColors}
+        />
       ) : undefined,
-    [onRefresh, isRefreshing],
+    [onRefresh, isRefreshing, theme.colors.foregroundMuted, refreshColors],
   );
 
   return (
@@ -540,12 +503,6 @@ export function AgentList({
         keyboardShouldPersistTaps="handled"
         ListFooterComponent={listFooterComponent}
         refreshControl={refreshControl}
-        // A history page is 200 rows per host. Defaults keep ten screens of them mounted and
-        // render 10 more per batch, which is what makes a flick on a phone drop frames.
-        initialNumToRender={14}
-        maxToRenderPerBatch={6}
-        updateCellsBatchingPeriod={50}
-        windowSize={5}
       />
 
       <Modal
@@ -640,19 +597,28 @@ const styles = StyleSheet.create((theme) => ({
     gap: theme.spacing[2],
     overflow: "hidden",
   },
-  providerIconWrap: {
-    width: theme.iconSize.md,
+  agentTitleRow: {
+    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
+    gap: theme.spacing[2],
+    flexShrink: 1,
+    minWidth: 0,
   },
-  mutedIcon: {
-    color: theme.colors.foregroundMuted,
+  providerIconWrap: {
+    flexShrink: 0,
   },
   workspaceTitleText: {
-    flexShrink: 0,
-    maxWidth: 220,
+    flexShrink: { xs: 1, md: 0 },
+    maxWidth: { xs: "100%", md: 320 },
     fontSize: theme.fontSize.base,
-    color: theme.colors.foregroundMuted,
+    color: theme.colors.foreground,
+  },
+  rowMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: theme.spacing[1],
+    marginTop: 2,
   },
   rowTrailing: {
     marginLeft: theme.spacing[2],
@@ -671,15 +637,10 @@ const styles = StyleSheet.create((theme) => ({
     minWidth: 0,
     fontSize: theme.fontSize.base,
     fontWeight: "400",
-    color: theme.colors.foreground,
-    opacity: 0.86,
-  },
-  sessionTitleHighlighted: {
-    opacity: 1,
+    color: theme.colors.foregroundMuted,
   },
   sessionMetaText: {
     maxWidth: "100%",
-    marginTop: 2,
     fontSize: theme.fontSize.base,
     color: theme.colors.foregroundMuted,
   },
