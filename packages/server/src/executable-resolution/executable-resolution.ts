@@ -17,14 +17,15 @@ function hasPathSeparator(value: string): boolean {
 }
 
 /**
- * Where a CLI lives when PATH does not say so.
+ * Where a CLI lives when PATH does not say so, on macOS only.
  *
  * A daemon launched from a GUI context — Finder, the Dock, a login item with no
  * PATH of its own — inherits the bare macOS launchd PATH,
  * `/usr/bin:/bin:/usr/sbin:/sbin`. Homebrew is not on it, so `gh` resolves to
  * nothing and the feature reports itself unavailable with no hint that the tool
  * is installed and working two directories away. Consulted only after PATH has
- * already failed, so a PATH the user controls always wins.
+ * already failed, so a PATH the user controls always wins. Other platforms keep
+ * PATH as the whole answer: a Linux service's PATH is its deployment's choice.
  */
 const FALLBACK_BIN_DIRS = [
   "/opt/homebrew/bin",
@@ -38,7 +39,7 @@ async function enumerateCandidates(name: string): Promise<string[]> {
     process.platform !== "win32" && existsSync("/usr/bin/which")
       ? await enumerateCandidatesViaSystemWhich(name)
       : await enumerateCandidatesViaLibrary(name);
-  if (found.length > 0 || process.platform === "win32") return found;
+  if (found.length > 0 || process.platform !== "darwin") return found;
 
   return FALLBACK_BIN_DIRS.map((dir) => `${dir}/${name}`).filter((candidate) =>
     existsSync(candidate),
