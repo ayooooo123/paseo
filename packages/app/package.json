@@ -117,7 +117,7 @@
     "react-freeze": "1.0.4",
     "react-i18next": "^17.0.8",
     "react-native": "0.81.5",
-    "react-native-bare-kit": "^0.14.5",
+    "react-native-bare-kit": "^0.15.6",
     "react-native-draggable-flatlist": "^4.0.3",
     "react-native-edge-to-edge": "^1.7.0",
     "react-native-gesture-handler": "~2.28.0",

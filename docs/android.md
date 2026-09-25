@@ -101,11 +101,22 @@ builder `npx` will fetch from the registry, and a linker version that disagrees 
 bundle produces addons the worker cannot load.
 
 A shipped `.so` can still fail with `ADDON_NOT_FOUND` when the addon needs a newer Bare than the
-one `react-native-bare-kit` embeds (Bare 1.29.4 in 0.14.5). The loader reports a version mismatch
-as a missing addon. Regenerating `package-lock.json` lets transitive addons float: `bare-type` 1.4.0
-(`engines.bare >=1.32.0`) broke every dial this way. After a lockfile change, compare each linked
-addon's `engines.bare` against the embedded Bare before you ship an APK, and pin anything newer.
+one `react-native-bare-kit` embeds (Bare 1.33.4 in 0.15.6; 0.14.5 shipped 1.29.4). The loader
+reports the version mismatch as a missing addon. `bare-type` 1.4.0 (`engines.bare >=1.32.0`) broke
+every dial this way on 0.14.5. When you bump `react-native-bare-kit` or any Bare addon, check every
+package in the worker bundle's graph: its `engines.bare` must be at or below the embedded Bare.
+`strings node_modules/react-native-bare-kit/android/libs/bare-kit/jni/arm64-v8a/libbare-kit.so`
+shows the embedded version. `npm install` leaves transitive addons at their locked versions; update
+them with `npm update <package>...`, then rebuild the worker bundle.
 Build the worker bundle with Node 24; `bare-pack` segfaults under Node 22.19.
+
+Pack from the repo root (`--base`), where npm hoists the worker's dependencies. Packed from
+`packages/app`, the bundle's keys start with `/../../node_modules/`. Bare 1.29 read those; Bare 1.33
+resolves them outside the bundle and the worklet aborts at startup with `CANNOT_READ`.
+
+You can check a bump against the embedded Bare without an APK: install `bare@<embedded version>`
+in a scratch directory, pack an entry that sets `globalThis.BareKit = { IPC }` and imports
+`dht-worker.mjs` with `--host darwin-arm64 --offload-addons`, and dial a running daemon with it.
 
 The desktop-managed daemon sets `PASEO_DHT_ENABLED=true` itself. Do not rely on a shell or launch
 agent to provide it: Electron does not inherit that environment, and replacing the launch-agent

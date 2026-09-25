@@ -13,6 +13,12 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appRoot = resolve(here, "..");
+// npm hoists the worker's dependencies to the repo root. Pack relative to that
+// root so bundle keys stay inside it (`/node_modules/...`). The default base
+// (the app package) yields `/../../node_modules/...` keys, which the bundle
+// loader in Bare 1.33 (react-native-bare-kit 0.15) resolves outside the bundle:
+// mounting fails with CANNOT_READ and the worklet aborts.
+const repoRoot = resolve(appRoot, "../..");
 const entry = join(appRoot, "src/runtime/dht/dht-worker.mjs");
 const resolverFile = join(appRoot, "src/runtime/dht/dht-worker-bundle.ts");
 const sourceFile = join(appRoot, "src/runtime/dht/dht-worker.bundle.js");
@@ -26,6 +32,8 @@ const args = [
   "bare-pack",
   ...hosts.flatMap((host) => ["--host", host]),
   "--linked",
+  "--base",
+  repoRoot,
   "--out",
   outBundle,
   entry,
