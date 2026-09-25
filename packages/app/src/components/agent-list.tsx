@@ -10,7 +10,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useCallback, useMemo, useState, type ReactElement } from "react";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { useIsCompactFormFactor } from "@/constants/layout";
@@ -18,6 +18,7 @@ import { formatTimeAgo } from "@/utils/time";
 import { type AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { useSessionStore } from "@/stores/session-store";
 import { Archive, ChevronRight } from "lucide-react-native";
+import { FONT_SIZE, ICON_SIZE, SPACING, type Theme } from "@/styles/theme";
 import { getProviderIcon } from "@/components/provider-icons";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { useArchiveAgent } from "@/hooks/use-archive-agent";
@@ -94,6 +95,14 @@ function formatDateSectionLabel(t: TFunction, section: DateSectionKey): string {
       return t("agentList.dateSections.older");
   }
 }
+
+const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+const ThemedArchive = withUnistyles(Archive, mutedIconMapping);
+const ThemedChevronRight = withUnistyles(ChevronRight, mutedIconMapping);
+const ThemedRefreshControl = withUnistyles(RefreshControl, (theme: Theme) => ({
+  tintColor: theme.colors.foregroundMuted,
+  colors: [theme.colors.foregroundMuted],
+}));
 
 function SessionBadge({
   label,
@@ -179,7 +188,6 @@ function SessionRow({
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
 }) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const timeAgo = formatTimeAgo(agent.lastActivityAt);
   const agentKey = `${agent.serverId}:${agent.id}`;
@@ -212,17 +220,15 @@ function SessionRow({
   const handlePress = useCallback(() => onPress(agent), [onPress, agent]);
   const handleLongPress = useCallback(() => onLongPress(agent), [onLongPress, agent]);
 
-  const archivedIcon = useMemo(
-    () => <Archive size={theme.fontSize.sm} color={theme.colors.foregroundMuted} />,
-    [theme.fontSize.sm, theme.colors.foregroundMuted],
-  );
+  // `ThemedArchive` re-renders itself on a theme change, so the element never goes stale.
+  const archivedIcon = useMemo(() => <ThemedArchive size={FONT_SIZE.sm} />, []);
   const showDesktopAttention =
     !isMobile && showAttentionIndicator && Boolean(agent.requiresAttention);
 
   const agentTitle = (
     <View style={styles.agentTitleRow}>
       <View style={styles.providerIconWrap}>
-        <ProviderIcon size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+        <ProviderIcon size={ICON_SIZE.sm} color={styles.mutedIcon.color} />
       </View>
       <HighlightedText
         text={agent.title || t("agentList.fallbackTitle")}
@@ -253,7 +259,7 @@ function SessionRow({
           />
           {!isMobile ? (
             <>
-              <ChevronRight size={theme.iconSize.xs} color={theme.colors.foregroundMuted} />
+              <ThemedChevronRight size={ICON_SIZE.xs} />
               {agentTitle}
             </>
           ) : null}
@@ -341,7 +347,6 @@ export function AgentList({
   showHostColumn = false,
   search,
 }: AgentListProps) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const [actionAgent, setActionAgent] = useState<AggregatedAgent | null>(null);
@@ -465,13 +470,9 @@ export function AgentList({
 
   const keyExtractor = useCallback((item: FlatListItem) => item.key, []);
 
-  const refreshColors = useMemo(
-    () => [theme.colors.foregroundMuted],
-    [theme.colors.foregroundMuted],
-  );
   const sheetContainerStyle = useMemo(
-    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, theme.spacing[6]) }],
-    [insets.bottom, theme.spacing],
+    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, SPACING[6]) }],
+    [insets.bottom],
   );
   const sheetArchiveTextStyle = useMemo(
     () => [styles.sheetArchiveText, isActionDaemonUnavailable && styles.sheetArchiveTextDisabled],
@@ -481,14 +482,9 @@ export function AgentList({
   const refreshControl = useMemo(
     () =>
       onRefresh ? (
-        <RefreshControl
-          refreshing={isRefreshing}
-          onRefresh={onRefresh}
-          tintColor={theme.colors.foregroundMuted}
-          colors={refreshColors}
-        />
+        <ThemedRefreshControl refreshing={isRefreshing} onRefresh={onRefresh} />
       ) : undefined,
-    [onRefresh, isRefreshing, theme.colors.foregroundMuted, refreshColors],
+    [onRefresh, isRefreshing],
   );
 
   return (
@@ -545,6 +541,9 @@ export function AgentList({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  mutedIcon: {
+    color: theme.colors.foregroundMuted,
+  },
   list: {
     flex: 1,
     minHeight: 0,

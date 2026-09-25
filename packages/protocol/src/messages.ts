@@ -1826,10 +1826,8 @@ export const AgentTimelineCursorSchema = z.object({
   seq: z.number().int().nonnegative(),
 });
 
-export const FetchAgentTimelineRequestMessageSchema = z.object({
-  type: z.literal("fetch_agent_timeline_request"),
+const AgentTimelineFetchInputSchema = z.object({
   agentId: z.string(),
-  requestId: z.string(),
   direction: z.enum(["tail", "before", "after"]).optional(),
   cursor: AgentTimelineCursorSchema.optional(),
   // 0 means "all matching rows for this query window".
@@ -1838,6 +1836,11 @@ export const FetchAgentTimelineRequestMessageSchema = z.object({
   projection: z.enum(["projected", "canonical"]).optional(),
   // Allow the client to merge this bounded page outside its contiguous loaded range.
   mergeWindow: z.boolean().optional(),
+});
+
+export const FetchAgentTimelineRequestMessageSchema = AgentTimelineFetchInputSchema.extend({
+  type: z.literal("fetch_agent_timeline_request"),
+  requestId: z.string(),
 });
 
 export const AgentTimelineSearchRequestMessageSchema = z.object({
@@ -1873,6 +1876,15 @@ export const ProviderSubagentTimelineRequestMessageSchema = z.object({
 export const SetAgentTimelineSubscriptionRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.set_subscription.request"),
   agentIds: z.array(z.string()),
+  requestId: z.string(),
+});
+
+// COMPAT(timelineSubscribeAndFetch): added in v0.7.2, remove after 2027-03-01. No daemon handles
+// or advertises it since the 0.9.2 merge; the shape stays so older fork apps and daemons parse.
+export const SubscribeAndFetchAgentTimelineRequestMessageSchema = z.object({
+  type: z.literal("agent.timeline.subscribe_and_fetch.request"),
+  agentIds: z.array(z.string()),
+  fetch: AgentTimelineFetchInputSchema,
   requestId: z.string(),
 });
 
@@ -3245,6 +3257,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
   SetAgentTimelineSubscriptionRequestMessageSchema,
+  SubscribeAndFetchAgentTimelineRequestMessageSchema,
   AgentForkContextRequestMessageSchema,
   SetAgentModeRequestMessageSchema,
   SetAgentModelRequestMessageSchema,
@@ -3668,6 +3681,8 @@ export const ServerInfoStatusPayloadSchema = z
         forgeProviders: z.boolean().optional(),
         // COMPAT(selectiveAgentTimeline): added in v0.1.106, remove after 2027-01-12.
         selectiveAgentTimeline: z.boolean().optional(),
+        // COMPAT(timelineSubscribeAndFetch): added in v0.7.2, remove after 2027-03-01.
+        timelineSubscribeAndFetch: z.boolean().optional(),
         explicitEventSubscriptions: z.boolean().optional(),
         ownedSubscriptions: z.boolean().optional(),
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.
@@ -4591,9 +4606,8 @@ export const AgentTimelineEntryPayloadSchema = z.object({
   collapsed: z.array(z.enum(["assistant_merge", "reasoning_merge", "tool_lifecycle", "identity"])),
 });
 
-export const FetchAgentTimelineResponseMessageSchema = z.object({
-  type: z.literal("fetch_agent_timeline_response"),
-  payload: z.object({
+const createFetchAgentTimelineResponsePayloadSchema = () =>
+  z.object({
     requestId: z.string(),
     agentId: z.string(),
     agent: AgentSnapshotPayloadSchema.nullable(),
@@ -4615,7 +4629,11 @@ export const FetchAgentTimelineResponseMessageSchema = z.object({
     mergeWindow: z.boolean().optional(),
     entries: z.array(AgentTimelineEntryPayloadSchema),
     error: z.string().nullable(),
-  }),
+  });
+
+export const FetchAgentTimelineResponseMessageSchema = z.object({
+  type: z.literal("fetch_agent_timeline_response"),
+  payload: createFetchAgentTimelineResponsePayloadSchema(),
 });
 
 export const AgentTimelineReplacementMessageSchema = z.object({
@@ -4772,6 +4790,16 @@ export const SetAgentTimelineSubscriptionResponseMessageSchema = z.object({
   payload: z.object({
     subscriptionId: z.string().optional(),
     agentIds: z.array(z.string()),
+    requestId: z.string(),
+  }),
+});
+
+// COMPAT(timelineSubscribeAndFetch): added in v0.7.2, remove after 2027-03-01.
+export const SubscribeAndFetchAgentTimelineResponseMessageSchema = z.object({
+  type: z.literal("agent.timeline.subscribe_and_fetch.response"),
+  payload: z.object({
+    agentIds: z.array(z.string()),
+    timeline: createFetchAgentTimelineResponsePayloadSchema(),
     requestId: z.string(),
   }),
 });
@@ -6836,6 +6864,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,
   SetAgentTimelineSubscriptionResponseMessageSchema,
+  SubscribeAndFetchAgentTimelineResponseMessageSchema,
   AgentAttentionRequiredMessageSchema,
   AgentForkContextResponseMessageSchema,
   CancelAgentResponseMessageSchema,
