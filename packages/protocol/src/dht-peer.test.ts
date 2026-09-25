@@ -5,6 +5,7 @@ import {
   DHT_DIAL_RETRY_BASE_MS,
   DHT_DIAL_TRANSIENT_CODES,
   PEER_FRAME_BINARY,
+  PEER_FRAME_CONTROL,
   PEER_FRAME_TEXT,
   PeerFrameDecoder,
   decodeBase64Url,
@@ -12,7 +13,10 @@ import {
   encodeBase64Url,
   encodePeerBinaryFrame,
   encodePeerInvite,
+  encodePeerLanHintFrame,
   encodePeerTextFrame,
+  parsePeerLanHint,
+  sanitizePeerLanAddresses,
 } from "./dht-peer.js";
 
 const key = (fill: number): Uint8Array => new Uint8Array(DHT_KEY_BYTES).fill(fill);
@@ -89,6 +93,50 @@ describe("dht-peer framing", () => {
     expect(out[0]!.type).toBe(PEER_FRAME_BINARY);
     // Buffer.compare keeps this O(n); toEqual walks 1M elements one at a time.
     expect(Buffer.compare(Buffer.from(out[0]!.payload), Buffer.from(payload))).toBe(0);
+  });
+});
+
+// The hint crosses the wire and sits in app storage, and every address in it
+// becomes a UDP handshake target, so only reachable-on-a-LAN addresses survive.
+describe("dht-peer LAN hint", () => {
+  it("round-trips private addresses through a CONTROL frame", () => {
+    const addresses = [
+      { host: "10.0.10.209", port: 49737 },
+      { host: "192.168.1.5", port: 1 },
+      { host: "172.31.255.255", port: 65535 },
+      { host: "100.101.102.103", port: 41641 },
+    ];
+    const [frame] = new PeerFrameDecoder().push(encodePeerLanHintFrame(addresses));
+    expect(frame!.type).toBe(PEER_FRAME_CONTROL);
+    expect(parsePeerLanHint(frame!.payload)).toEqual(addresses);
+  });
+
+  it("drops public, malformed and out-of-range entries", () => {
+    expect(
+      sanitizePeerLanAddresses([
+        { host: "107.194.4.98", port: 49737 },
+        { host: "172.32.0.1", port: 49737 },
+        { host: "100.128.0.1", port: 49737 },
+        { host: "10.0.0.256", port: 49737 },
+        { host: "10.0.0.1", port: 0 },
+        { host: "10.0.0.1", port: 65536 },
+        { host: "10.0.0.1", port: 1.5 },
+        { host: "fe80::1", port: 49737 },
+        "10.0.0.1:49737",
+        null,
+        { host: "10.0.0.2", port: 49737 },
+      ]),
+    ).toEqual([{ host: "10.0.0.2", port: 49737 }]);
+    expect(sanitizePeerLanAddresses({ host: "10.0.0.2", port: 49737 })).toEqual([]);
+  });
+
+  it("ignores CONTROL payloads that are not a usable LAN hint", () => {
+    const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+    expect(parsePeerLanHint(new TextEncoder().encode("not json"))).toBeNull();
+    expect(parsePeerLanHint(encode({ type: "other", addresses: [] }))).toBeNull();
+    expect(
+      parsePeerLanHint(encode({ type: "lan", addresses: [{ host: "8.8.8.8", port: 1 }] })),
+    ).toBeNull();
   });
 });
 describe("dht dial retry policy", () => {

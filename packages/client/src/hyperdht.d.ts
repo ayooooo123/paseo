@@ -20,7 +20,11 @@ declare module "hyperdht" {
     static keyPair(seed?: Buffer | Uint8Array): HyperDhtKeyPair;
     connect(
       publicKey: Buffer | Uint8Array,
-      options?: { keyPair?: HyperDhtKeyPair },
+      options?: {
+        keyPair?: HyperDhtKeyPair;
+        /** Nodes to send the handshake to first; the daemon's own node connects direct. */
+        relayAddresses?: ReadonlyArray<{ host: string; port: number }>;
+      },
     ): HyperDhtStream;
     destroy(): Promise<void>;
   }

@@ -151,6 +151,84 @@ export function encodePeerBinaryFrame(bytes: Uint8Array): Uint8Array {
   return encodePeerFrame(PEER_FRAME_BINARY, bytes);
 }
 
+// ---- LAN hint (daemon -> client CONTROL frame) -------------------------------
+// hyperdht only tries a LAN connection when the DHT node relaying the handshake
+// sees both ends behind the same public IP (lib/connect.js, lib/server.js). A
+// phone and a daemon on one Wi-Fi that leave through different egresses — a VPN
+// or policy route on one side, dual WAN — fail that check and fall through to a
+// holepunch, which a randomized NAT aborts (HOLEPUNCH_ABORTED on every dial).
+//
+// So the daemon sends each connected client the LAN addresses of its DHT
+// socket, and the client passes them to connect() as `relayAddresses` on the
+// next dial. hyperdht sends the handshake straight there; when the daemon's own
+// node answers, the connection is direct and no public-IP comparison happens.
+// The normal lookup still runs alongside, so a stale or unreachable hint costs
+// nothing. The hint arrives over the authenticated stream, and a dial to a wrong
+// address can still only complete against the daemon's key.
+//
+// Old clients ignore CONTROL frames from the daemon, and a new client dialing an
+// old daemon never receives one, so no capability gate is needed.
+export interface PeerLanAddress {
+  readonly host: string;
+  readonly port: number;
+}
+
+const LAN_HINT_MAX_ADDRESSES = 8;
+const textDecoder = new TextDecoder();
+
+/**
+ * Private IPv4 ranges a peer on the same network can reach directly: RFC 1918
+ * plus 100.64.0.0/10, the shared range Tailscale and other overlays hand out.
+ */
+export function isPeerLanHost(host: string): boolean {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!match) return false;
+  const octets = match.slice(1).map(Number);
+  if (octets.some((octet) => octet > 255)) return false;
+  const [a, b] = octets as [number, number, number, number];
+  return (
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127)
+  );
+}
+
+/** Keeps only well-formed LAN addresses; anything else from the wire or from storage is dropped. */
+export function sanitizePeerLanAddresses(value: unknown): PeerLanAddress[] {
+  if (!Array.isArray(value)) return [];
+  const out: PeerLanAddress[] = [];
+  for (const entry of value) {
+    if (out.length >= LAN_HINT_MAX_ADDRESSES) break;
+    if (typeof entry !== "object" || entry === null) continue;
+    if (!("host" in entry) || !("port" in entry)) continue;
+    const { host, port } = entry;
+    if (typeof host !== "string" || !isPeerLanHost(host)) continue;
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) continue;
+    out.push({ host, port });
+  }
+  return out;
+}
+
+export function encodePeerLanHintFrame(addresses: readonly PeerLanAddress[]): Uint8Array {
+  const payload = { type: "lan", addresses: addresses.slice(0, LAN_HINT_MAX_ADDRESSES) };
+  return encodePeerFrame(PEER_FRAME_CONTROL, textEncoder.encode(JSON.stringify(payload)));
+}
+
+/** Reads a CONTROL frame payload; null when it is not a LAN hint with at least one usable address. */
+export function parsePeerLanHint(payload: Uint8Array): PeerLanAddress[] | null {
+  let message: unknown;
+  try {
+    message = JSON.parse(textDecoder.decode(payload));
+  } catch {
+    return null;
+  }
+  if (typeof message !== "object" || message === null) return null;
+  if (!("type" in message) || message.type !== "lan" || !("addresses" in message)) return null;
+  const addresses = sanitizePeerLanAddresses(message.addresses);
+  return addresses.length > 0 ? addresses : null;
+}
+
 export interface DecodedPeerFrame {
   readonly type: PeerFrameType;
   readonly payload: Uint8Array;

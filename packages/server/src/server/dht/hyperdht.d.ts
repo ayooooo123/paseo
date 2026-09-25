@@ -14,6 +14,8 @@ declare module "hyperdht" {
     once(event: string, listener: (...args: unknown[]) => void): this;
     writableLength?: number;
     readonly remotePublicKey?: Buffer;
+    /** The UDX stream underneath; its remote is the address the connection landed on. */
+    readonly rawStream?: { readonly remoteHost: string; readonly remotePort: number };
   }
 
   export interface HyperDhtServer {
@@ -44,8 +46,16 @@ declare module "hyperdht" {
     ): HyperDhtServer;
     connect(
       publicKey: Buffer | Uint8Array,
-      options?: { keyPair?: HyperDhtKeyPair },
+      options?: {
+        keyPair?: HyperDhtKeyPair;
+        /** false disables hyperdht's same-public-IP LAN route. */
+        localConnection?: boolean;
+        /** Nodes to send the handshake to first; the server's own node connects direct. */
+        relayAddresses?: ReadonlyArray<{ host: string; port: number }>;
+      },
     ): HyperDhtStream;
+    /** The DHT server socket's LAN-facing address (dht-rpc). */
+    localAddress(): { host: string; port: number } | null;
     destroy(): Promise<void>;
   }
 }

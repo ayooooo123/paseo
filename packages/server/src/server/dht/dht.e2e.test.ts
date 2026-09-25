@@ -3,7 +3,13 @@ import DHT from "hyperdht";
 import createTestnet from "hyperdht/testnet.js";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { createDhtTransportFactory } from "@getpaseo/client/internal/dht-transport";
-import { encodePeerInvite } from "@getpaseo/protocol/dht-peer";
+import {
+  PEER_FRAME_CONTROL,
+  PeerFrameDecoder,
+  encodePeerInvite,
+  parsePeerLanHint,
+  type PeerLanAddress,
+} from "@getpaseo/protocol/dht-peer";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { loadOrCreateDhtIdentity } from "./dht-identity.js";
 
@@ -83,5 +89,43 @@ describe("hyperdht peer transport end-to-end", () => {
     await expect(client.connect()).rejects.toThrow();
     expect(client.isConnected).toBe(false);
     expect(client.getLastServerInfoMessage()).toBeNull();
+  }, 40_000);
+
+  // hyperdht's own LAN route needs both ends to share a public IP. When their
+  // egresses differ, the daemon's LAN hint is the only direct path, so the hint
+  // it sends has to connect by itself: from a node with no DHT to look the
+  // daemon up in, and with hyperdht's LAN route switched off.
+  it("sends a LAN hint that connects without the DHT or hyperdht's LAN route", async () => {
+    const { testnet, daemon } = await setup();
+    const { publicKey } = loadOrCreateDhtIdentity(daemon.paseoHome).keyPair;
+
+    const client = new DHT({ bootstrap: testnet.bootstrap });
+    cleanups.push(() => client.destroy());
+    const hint = await new Promise<PeerLanAddress[]>((resolve, reject) => {
+      const stream = client.connect(publicKey);
+      const decoder = new PeerFrameDecoder();
+      stream.on("error", reject);
+      stream.on("data", (chunk) => {
+        for (const frame of decoder.push(chunk)) {
+          const parsed = frame.type === PEER_FRAME_CONTROL ? parsePeerLanHint(frame.payload) : null;
+          if (!parsed) continue;
+          stream.destroy();
+          resolve(parsed);
+        }
+      });
+    });
+
+    const isolated = new DHT({ bootstrap: [] });
+    cleanups.push(() => isolated.destroy());
+    const opened = await new Promise<string>((resolve, reject) => {
+      const stream = isolated.connect(publicKey, { localConnection: false, relayAddresses: hint });
+      stream.on("error", reject);
+      stream.on("open", () => {
+        resolve(`${stream.rawStream?.remoteHost}:${stream.rawStream?.remotePort}`);
+        stream.destroy();
+      });
+    });
+
+    expect(hint.map((address) => `${address.host}:${address.port}`)).toContain(opened);
   }, 40_000);
 });

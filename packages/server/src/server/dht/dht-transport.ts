@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { networkInterfaces } from "node:os";
 import type pino from "pino";
 import DHT, { type HyperDhtKeyPair, type HyperDhtServer, type HyperDhtStream } from "hyperdht";
 import {
@@ -7,6 +8,9 @@ import {
   PEER_FRAME_TEXT,
   PEER_FRAME_BINARY,
   encodeBase64Url,
+  encodePeerLanHintFrame,
+  isPeerLanHost,
+  type PeerLanAddress,
   encodePeerBinaryFrame,
   encodePeerTextFrame,
 } from "@getpaseo/protocol/dht-peer";
@@ -172,8 +176,22 @@ export function createDhtHost(options: DhtHostOptions): DhtHost {
         if (type !== PEER_FRAME_CONTROL) bridge.deliver(type, payload);
       }
     });
-
     log.info({ peer }, "dht_peer_connected");
+    // Tell the client where this node listens on the LAN, so its next dial can
+    // go direct even when the two ends leave through different public IPs.
+    // Read per connection: interfaces come and go with the network.
+    const port = dht.localAddress()?.port;
+    if (port) {
+      const addresses: PeerLanAddress[] = [];
+      for (const entries of Object.values(networkInterfaces())) {
+        for (const entry of entries ?? []) {
+          if (entry.family === "IPv4" && !entry.internal && isPeerLanHost(entry.address)) {
+            addresses.push({ host: entry.address, port });
+          }
+        }
+      }
+      if (addresses.length > 0) stream.write(encodePeerLanHintFrame(addresses));
+    }
     void Promise.resolve(attachSocket(bridge.socket, { transport: "hyperdht" }))
       .then(() => bridge.flush())
       .catch((error) => {

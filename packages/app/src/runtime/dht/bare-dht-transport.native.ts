@@ -1,3 +1,4 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AppState, type AppStateStatus } from "react-native";
 import { Worklet } from "react-native-bare-kit";
 import {
@@ -5,9 +6,13 @@ import {
   PEER_FRAME_CONTROL,
   PEER_FRAME_TEXT,
   PEER_FRAME_BINARY,
+  decodePeerInvite,
   encodePeerFrame,
   encodePeerBinaryFrame,
   encodePeerTextFrame,
+  peerInviteFingerprint,
+  sanitizePeerLanAddresses,
+  type PeerLanAddress,
 } from "@getpaseo/protocol/dht-peer";
 import type {
   DaemonTransport,
@@ -53,6 +58,8 @@ const IDLE_SHUTDOWN_MS = 5 * 60_000;
  * the ack is not fatal — the node comes back parked either way — so this only
  * has to be short enough not to hold up backgrounding. */
 const SUSPEND_ACK_TIMEOUT_MS = 400;
+
+const LAN_HINT_KEY_PREFIX = "paseo.dht.lan.v1:";
 
 interface IpcDuplex {
   write(data: Uint8Array): void;
@@ -161,6 +168,24 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
     }
   };
 
+  // The daemon's last LAN hint (see the LAN hint section in dht-peer), kept per
+  // daemon so a cold start on its network dials direct. That is the only dial
+  // that connects when the phone and daemon leave through different public IPs.
+  // Not secret: addresses of a daemon this device already reached.
+  let lanHintKey: string | null = null;
+  try {
+    lanHintKey = `${LAN_HINT_KEY_PREFIX}${peerInviteFingerprint(decodePeerInvite(options.invite))}`;
+  } catch {
+    // A malformed invite fails the dial in the worker, which reports it.
+  }
+  // Fresh hints from the daemon win over the stored one.
+  let lanHint: PeerLanAddress[] | null = null;
+  const storedLanHint: Promise<PeerLanAddress[]> = lanHintKey
+    ? AsyncStorage.getItem(lanHintKey)
+        .then((raw) => (raw ? sanitizePeerLanAddresses(JSON.parse(raw)) : []))
+        .catch(() => [])
+    : Promise.resolve([]);
+
   ipc.on("data", (chunk) => {
     let frames;
     try {
@@ -183,6 +208,13 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
           continue;
         }
         if (message.ipc === "resumed") continue;
+        if (message.ipc === "lan") {
+          lanHint = sanitizePeerLanAddresses(message.addresses);
+          if (lanHintKey) {
+            void AsyncStorage.setItem(lanHintKey, JSON.stringify(lanHint)).catch(() => {});
+          }
+          continue;
+        }
         sink?.onControl(message);
         continue;
       }
@@ -206,7 +238,7 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
       idleTimer = null;
       sink = next;
       void (async () => {
-        const seed = await seedPromise;
+        const [seed, stored] = await Promise.all([seedPromise, storedLanHint]);
         // A release or a newer connect landed while the Keychain read was in
         // flight; that dial is no longer wanted.
         if (disposed || sink !== next) return;
@@ -215,6 +247,7 @@ function createWorkletSession(options: BareDhtTransportOptions, key: string): Wo
           invite: options.invite,
           bootstrap: options.bootstrap,
           ...(seed ? { seed } : {}),
+          lan: lanHint ?? stored,
         });
       })();
     },

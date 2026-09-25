@@ -11,9 +11,12 @@
 import DHT, { type HyperDhtStream } from "hyperdht";
 import {
   PeerFrameDecoder,
+  PEER_FRAME_CONTROL,
   PEER_FRAME_TEXT,
   PEER_FRAME_BINARY,
   decodePeerInvite,
+  parsePeerLanHint,
+  type PeerLanAddress,
   encodePeerBinaryFrame,
   encodePeerTextFrame,
   DHT_DIAL_MAX_ATTEMPTS,
@@ -35,6 +38,9 @@ type EventHandler = (event?: unknown) => void;
 
 export function createDhtTransportFactory(options: DhtTransportOptions): DaemonTransportFactory {
   const { publicKey } = decodePeerInvite(options.invite);
+  // The daemon's last LAN hint, shared by every transport this factory makes so
+  // a reconnect dials direct. See the LAN hint section in dht-peer.
+  let lanHint: PeerLanAddress[] = [];
 
   return (): DaemonTransport => {
     const dht =
@@ -61,7 +67,10 @@ export function createDhtTransportFactory(options: DhtTransportOptions): DaemonT
     let phase: "connecting" | "open" | "closed" = "connecting";
     const startDial = (): void => {
       dialAttempt += 1;
-      const attempt = { stream: dht.connect(publicKey), dead: false };
+      const attempt = {
+        stream: dht.connect(publicKey, lanHint.length > 0 ? { relayAddresses: lanHint } : {}),
+        dead: false,
+      };
       current = attempt;
       const live = (): boolean => !attempt.dead && current === attempt;
       const decoder = new PeerFrameDecoder();
@@ -87,6 +96,8 @@ export function createDhtTransportFactory(options: DhtTransportOptions): DaemonT
             // slice() already produces an exact-length buffer; copying it
             // again doubled the cost of every binary message.
             deliver(payload.slice().buffer, true);
+          } else if (type === PEER_FRAME_CONTROL) {
+            lanHint = parsePeerLanHint(payload) ?? lanHint;
           }
         }
       });

@@ -1,7 +1,11 @@
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type DHT from "hyperdht";
-import { DHT_DIAL_MAX_ATTEMPTS, encodePeerInvite } from "@getpaseo/protocol/dht-peer";
+import {
+  DHT_DIAL_MAX_ATTEMPTS,
+  encodePeerInvite,
+  encodePeerLanHintFrame,
+} from "@getpaseo/protocol/dht-peer";
 import { createDhtTransportFactory } from "./dht-transport.js";
 
 // A dial-scriptable fake: each connect() consumes the next scripted outcome.
@@ -26,12 +30,14 @@ class FakeDHT {
   attempts = 0;
   destroyed = false;
   lastStream: FakeStream | null = null;
+  readonly dialOptions: unknown[] = [];
 
   constructor(private readonly outcomes: readonly DialOutcome[]) {}
 
-  connect(): FakeStream {
+  connect(_publicKey: Uint8Array, options?: unknown): FakeStream {
     const outcome = this.outcomes[Math.min(this.attempts, this.outcomes.length - 1)]!;
     this.attempts += 1;
+    this.dialOptions.push(options);
     const stream = new FakeStream();
     this.lastStream = stream;
     // Zero-delay timers (not microtasks) so vi.useFakeTimers drives the emits.
@@ -143,5 +149,25 @@ describe("dht-transport dial ladder", () => {
     // No further dials once closed, even though ladder attempts remained.
     await vi.advanceTimersByTimeAsync(60_000);
     expect(dht.attempts).toBe(1);
+  });
+
+  // A phone and daemon on one LAN but different egresses only connect when the
+  // dial goes straight to the daemon's LAN address; the daemon says where that
+  // is once a connection opens, and every later dial has to use it.
+  it("dials the daemon's LAN hint on later connects", async () => {
+    const dht = new FakeDHT(["open"]);
+    const factory = factoryFor(dht);
+    const first = factory();
+    const events = watch(first);
+    await vi.waitFor(() => expect(events).toContain("open"));
+    expect(dht.dialOptions[0]).toEqual({});
+
+    const lan = [{ host: "10.0.10.209", port: 49737 }];
+    dht.lastStream!.emit("data", Buffer.from(encodePeerLanHintFrame(lan)));
+    first.close();
+    factory();
+
+    await vi.waitFor(() => expect(dht.attempts).toBe(2));
+    expect(dht.dialOptions[1]).toEqual({ relayAddresses: lan });
   });
 });

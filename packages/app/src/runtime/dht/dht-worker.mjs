@@ -18,6 +18,8 @@ import {
   PEER_FRAME_BINARY,
   decodeBase64Url,
   decodePeerInvite,
+  parsePeerLanHint,
+  sanitizePeerLanAddresses,
   encodePeerFrame,
   DHT_DIAL_MAX_ATTEMPTS,
   DHT_DIAL_RETRY_BASE_MS,
@@ -49,6 +51,9 @@ let connectSession = 0;
 let dhtDecoder = null;
 let phase = "idle"; // idle -> connecting -> open
 let publicKey = null;
+// The daemon's LAN hint (see dht-peer): handed to connect() as relayAddresses so
+// a phone on the daemon's network dials direct even when their egresses differ.
+let lanAddresses = [];
 
 // hyperdht's suspend() and resume() are async several layers deep and have no
 // internal lock: suspend() sets `_connectable = false` on its first line, then
@@ -125,13 +130,14 @@ function teardown() {
   node?.destroy().catch(() => {});
 }
 
-async function connect(invite, bootstrap, seed) {
+async function connect(invite, bootstrap, seed, lan) {
   // Claim the session before the first await: a stale connect that finishes
   // its awaits after a newer one must lose, so order is taken at call time.
   const session = ++connectSession;
   await loadNativeModules();
 
   publicKey = decodePeerInvite(invite).publicKey;
+  lanAddresses = sanitizePeerLanAddresses(lan);
 
   // Reuse the node across reconnects: a fresh DHT throws away the routing table
   // and the cached peer address, so every reconnect would re-bootstrap and dial
@@ -186,6 +192,7 @@ function attemptDial(session, keyPair, attempt) {
   stream = dht.connect(publicKey, {
     reusableSocket: true,
     ...(keyPair ? { keyPair } : {}),
+    ...(lanAddresses.length > 0 ? { relayAddresses: lanAddresses } : {}),
   });
   dhtDecoder = new PeerFrameDecoder();
   phase = "connecting";
@@ -247,6 +254,13 @@ function attemptDial(session, keyPair, attempt) {
       // on every terminal frame for no reason — RN decodes once on receipt.
       if (type === PEER_FRAME_TEXT || type === PEER_FRAME_BINARY) {
         ipc.write(encodePeerFrame(type, payload));
+      } else if (type === PEER_FRAME_CONTROL) {
+        const hint = parsePeerLanHint(payload);
+        if (hint) {
+          lanAddresses = hint;
+          // RN persists it, so a cold start dials direct too.
+          ipcControl({ ipc: "lan", addresses: hint });
+        }
       }
     }
   });
@@ -266,7 +280,7 @@ ipc.on("data", (chunk) => {
         // An unhandled rejection here aborts the worklet thread and with it the
         // whole app, so every dial failure — including a missing native addon —
         // has to come back as an IPC error the RN side can surface.
-        connect(message.invite, message.bootstrap, message.seed).catch((error) => {
+        connect(message.invite, message.bootstrap, message.seed, message.lan).catch((error) => {
           ipcControl({
             ipc: "error",
             message: String(error?.message ?? error),
