@@ -100,6 +100,13 @@ The plugin resolves the installed `bare-link` through `require.resolve` instead 
 builder `npx` will fetch from the registry, and a linker version that disagrees with the packed
 bundle produces addons the worker cannot load.
 
+A shipped `.so` can still fail with `ADDON_NOT_FOUND` when the addon needs a newer Bare than the
+one `react-native-bare-kit` embeds (Bare 1.29.4 in 0.14.5). The loader reports a version mismatch
+as a missing addon. Regenerating `package-lock.json` lets transitive addons float: `bare-type` 1.4.0
+(`engines.bare >=1.32.0`) broke every dial this way. After a lockfile change, compare each linked
+addon's `engines.bare` against the embedded Bare before you ship an APK, and pin anything newer.
+Build the worker bundle with Node 24; `bare-pack` segfaults under Node 22.19.
+
 The desktop-managed daemon sets `PASEO_DHT_ENABLED=true` itself. Do not rely on a shell or launch
 agent to provide it: Electron does not inherit that environment, and replacing the launch-agent
 daemon with a desktop-managed daemon would leave mobile clients dialing a peer that no longer
