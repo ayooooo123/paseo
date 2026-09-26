@@ -5,13 +5,15 @@ declare module "hyperdht" {
   }
 
   export interface HyperDhtStream {
-    write(data: Uint8Array, callback?: (error?: Error | null) => void): boolean;
+    /** streamx: no callback. Returns false above the high-water mark; wait for "drain". */
+    write(data: Uint8Array): boolean;
     end(): void;
     destroy(error?: Error): void;
     on(event: "data", listener: (chunk: Buffer) => void): this;
     on(event: "open" | "end" | "close" | "connect" | "drain", listener: () => void): this;
     on(event: "error", listener: (error: Error) => void): this;
     once(event: string, listener: (...args: unknown[]) => void): this;
+    removeListener(event: string, listener: (...args: unknown[]) => void): this;
     writableLength?: number;
     readonly remotePublicKey?: Buffer;
     /** The UDX stream underneath; its remote is the address the connection landed on. */

@@ -70,15 +70,34 @@ function dhtStreamToWebSocketLike(stream: HyperDhtStream): DhtWebSocketBridge {
         callback?.(new Error("dht socket is not open"));
         return;
       }
+      // streamx write() takes no callback. Report completion when the frame fits
+      // under the high-water mark, otherwise when the stream drains or closes.
+      let accepted: boolean;
       try {
-        const frame =
+        accepted = stream.write(
           typeof data === "string"
             ? encodePeerTextFrame(data)
-            : encodePeerBinaryFrame(data instanceof ArrayBuffer ? new Uint8Array(data) : data);
-        stream.write(frame, (error) => callback?.(error ?? undefined));
+            : encodePeerBinaryFrame(data instanceof ArrayBuffer ? new Uint8Array(data) : data),
+        );
       } catch (error) {
         callback?.(error instanceof Error ? error : new Error(String(error)));
+        return;
       }
+      if (!callback) return;
+      if (accepted) {
+        queueMicrotask(() => callback());
+        return;
+      }
+      const onDrain = (): void => {
+        stream.removeListener("close", onStreamClose);
+        callback();
+      };
+      const onStreamClose = (): void => {
+        stream.removeListener("drain", onDrain);
+        callback(new Error("dht socket closed before the frame was sent"));
+      };
+      stream.once("drain", onDrain);
+      stream.once("close", onStreamClose);
     },
     close() {
       if (readyState === 3) return;
@@ -111,9 +130,10 @@ function dhtStreamToWebSocketLike(stream: HyperDhtStream): DhtWebSocketBridge {
     if (type === PEER_FRAME_TEXT) {
       emitMessage(new TextDecoder("utf-8", { fatal: false }).decode(payload), false);
     } else if (type === PEER_FRAME_BINARY) {
-      // slice() already produces an exact-length buffer; copying it again
-      // doubled the cost of every binary message.
-      emitMessage(payload.slice().buffer, true);
+      // The payload can be a Buffer view into a pooled stream chunk, where
+      // slice() does not copy and .buffer is the whole pool. Copy into an
+      // exact-length Uint8Array so the ArrayBuffer holds only this frame.
+      emitMessage(new Uint8Array(payload).buffer, true);
     }
   };
 

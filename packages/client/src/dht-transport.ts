@@ -93,9 +93,10 @@ export function createDhtTransportFactory(options: DhtTransportOptions): DaemonT
           if (type === PEER_FRAME_TEXT) {
             deliver(new TextDecoder("utf-8", { fatal: false }).decode(payload), false);
           } else if (type === PEER_FRAME_BINARY) {
-            // slice() already produces an exact-length buffer; copying it
-            // again doubled the cost of every binary message.
-            deliver(payload.slice().buffer, true);
+            // The payload can be a Node Buffer view into a pooled chunk, where
+            // slice() does not copy and .buffer is the whole pool. Copy into an
+            // exact-length Uint8Array so the ArrayBuffer holds only this frame.
+            deliver(new Uint8Array(payload).buffer, true);
           } else if (type === PEER_FRAME_CONTROL) {
             lanHint = parsePeerLanHint(payload) ?? lanHint;
           }

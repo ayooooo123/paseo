@@ -1,3 +1,7 @@
+import { randomBytes } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import DHT from "hyperdht";
 import createTestnet from "hyperdht/testnet.js";
@@ -63,6 +67,61 @@ describe("hyperdht peer transport end-to-end", () => {
     const agents = await client.fetchAgents();
     expect(agents).toBeTruthy();
     expect(Array.isArray(agents.entries)).toBe(true);
+  }, 40_000);
+
+  // File previews and mobile downloads stream the file as binary frames and
+  // wait for each frame to flush. A HyperDHT stream write takes no callback, so
+  // a transport that waits for one never sends the second frame.
+  it("streams a multi-chunk binary file to a daemon client over HyperDHT", async () => {
+    const { testnet, invite } = await setup();
+    const workspace = await mkdtemp(path.join(tmpdir(), "dht-file-read-"));
+    cleanups.push(() => rm(workspace, { recursive: true, force: true }));
+    const payload = randomBytes(1024 * 1024);
+    await writeFile(path.join(workspace, "payload.bin"), payload);
+    const client = new DaemonClient({
+      url: "ws://hyperdht.invalid/ws",
+      clientId: "dht-e2e-file-client",
+      clientType: "cli",
+      reconnect: { enabled: false },
+      connectTimeoutMs: 20_000,
+      transportFactory: createDhtTransportFactory({ invite, bootstrap: testnet.bootstrap }),
+    });
+    cleanups.push(() => client.close());
+    await client.connect();
+
+    const file = await client.readFile(workspace, "payload.bin");
+
+    expect(file.size).toBe(payload.byteLength);
+    expect(Buffer.from(file.bytes).equals(payload)).toBe(true);
+  }, 40_000);
+
+  // Uploads send FileBegin/FileEnd as small binary frames that arrive inside a
+  // single stream chunk, where the decoder hands back a Buffer view into a
+  // pooled chunk. The daemon must copy exactly those bytes, not the whole pool.
+  it("receives a multi-chunk upload from a daemon client over HyperDHT", async () => {
+    const { testnet, invite } = await setup();
+    const payload = randomBytes(1024 * 1024 + 7);
+    const client = new DaemonClient({
+      url: "ws://hyperdht.invalid/ws",
+      clientId: "dht-e2e-upload-client",
+      clientType: "cli",
+      reconnect: { enabled: false },
+      connectTimeoutMs: 20_000,
+      transportFactory: createDhtTransportFactory({ invite, bootstrap: testnet.bootstrap }),
+    });
+    cleanups.push(() => client.close());
+    await client.connect();
+
+    const result = await client.uploadFile({
+      fileName: "clip.bin",
+      mimeType: "application/octet-stream",
+      bytes: payload,
+    });
+
+    expect(result.error).toBeNull();
+    expect(result.file?.size).toBe(payload.byteLength);
+    const stored = await readFile(result.file?.path ?? "");
+    expect(stored.equals(payload)).toBe(true);
   }, 40_000);
 
   // Authorization is the Noise handshake: a dial only completes against the
