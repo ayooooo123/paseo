@@ -51,6 +51,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import * as Clipboard from "expo-clipboard";
 import { useFileDownload } from "@/hooks/use-file-download";
+import type { DownloadDestination } from "@/stores/download-store";
 import { useIsLocalDaemon } from "@/hooks/use-is-local-daemon";
 import { buildAbsoluteExplorerPath } from "@/utils/explorer-paths";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -1643,8 +1644,8 @@ export function ChangesSurface({
     [cwd, fileManagerTarget, t, toast],
   );
   const handleDownloadPath = useCallback(
-    (path: string) => {
-      downloadFile({ fileName: path.split("/").pop() ?? path, path });
+    (path: string, destination: DownloadDestination) => {
+      downloadFile({ fileName: path.split("/").pop() ?? path, path, destination });
     },
     [downloadFile],
   );

@@ -29,6 +29,7 @@ import {
   formatDiffCount,
 } from "@/git/file-header-presentation";
 import type { ParsedDiffFile } from "@/git/use-diff-query";
+import type { DownloadDestination } from "@/stores/download-store";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 
 export interface FileHeaderProps {
@@ -49,7 +50,7 @@ export interface FileHeaderProps {
   onCopyRelativePath?: (path: string) => void;
   onReveal?: (path: string) => void;
   revealTargetName?: string;
-  onDownload?: (path: string) => void;
+  onDownload?: (path: string, destination: DownloadDestination) => void;
   onDuplicate?: (path: string) => void;
   onRevert?: (path: string, oldPath?: string) => void;
   onHeaderHeightChange?: (path: string, height: number) => void;
@@ -157,7 +158,10 @@ function FileHeaderMenu({
     [file.path, onCopyRelativePath],
   );
   const reveal = useCallback(() => onReveal?.(file.path), [file.path, onReveal]);
-  const download = useCallback(() => onDownload?.(file.path), [file.path, onDownload]);
+  const download = useCallback(
+    (destination: DownloadDestination) => onDownload?.(file.path, destination),
+    [file.path, onDownload],
+  );
   const duplicate = useCallback(() => onDuplicate?.(file.path), [file.path, onDuplicate]);
   const revert = useCallback(
     () => onRevert?.(file.path, file.oldPath),

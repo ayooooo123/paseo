@@ -463,6 +463,7 @@ export const ar: TranslationResources = {
       copyRelativePath: "نسخ المسار النسبي",
       revealIn: "إظهار في {{target}}",
       download: "تحميل",
+      saveToDevice: "حفظ على الجهاز",
       addToChat: "إضافة إلى الدردشة",
       moreActions: "المزيد من الإجراءات",
       newFile: "ملف جديد",
@@ -1781,7 +1782,6 @@ export const ar: TranslationResources = {
   },
   downloads: {
     requestTokenFailed: "فشل طلب رمز التنزيل.",
-    hostUnavailable: "مضيف التنزيل غير متاح.",
     cancelled: "تم إلغاء التنزيل.",
     failed: "فشل تنزيل الملف.",
     shareFile: "مشاركة الملف",

@@ -469,6 +469,7 @@ export const es: TranslationResources = {
       copyRelativePath: "Copiar ruta relativa",
       revealIn: "Mostrar en {{target}}",
       download: "Descargar",
+      saveToDevice: "Guardar en el dispositivo",
       addToChat: "Añadir al chat",
       moreActions: "Más acciones",
       newFile: "Nuevo archivo",
@@ -1829,7 +1830,6 @@ export const es: TranslationResources = {
   },
   downloads: {
     requestTokenFailed: "No se pudo solicitar el token de descarga.",
-    hostUnavailable: "El host de descarga no está disponible.",
     cancelled: "La descarga fue cancelada.",
     failed: "No se pudo descargar el archivo.",
     shareFile: "compartir archivo",

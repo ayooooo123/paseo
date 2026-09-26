@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from "react";
-import { useHosts } from "@/runtime/host-runtime";
-import { useDownloadStore } from "@/stores/download-store";
+import { getHostRuntimeStore, useHosts } from "@/runtime/host-runtime";
+import type { DownloadDestination } from "@/stores/download-store";
+import { useDownloadStore } from "@/stores/use-download-store";
 import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
 
 interface UseFileDownloadParams {
@@ -12,14 +13,18 @@ interface UseFileDownloadParams {
 /**
  * Returns a stable callback that downloads a single workspace file by its
  * workspace-relative path. Shared by the file explorer tree and the git diff
- * pane so both surfaces download through the same host token + download-store
- * pipeline instead of duplicating the plumbing.
+ * pane so both surfaces download through the same download-store pipeline:
+ * HTTP token download over direct TCP, session streaming over everything else.
  */
 export function useFileDownload({
   serverId,
   workspaceId,
   workspaceRoot,
-}: UseFileDownloadParams): (input: { fileName: string; path: string }) => void {
+}: UseFileDownloadParams): (input: {
+  fileName: string;
+  path: string;
+  destination: DownloadDestination;
+}) => void {
   const daemons = useHosts();
   const daemonProfile = useMemo(
     () => daemons.find((daemon) => daemon.serverId === serverId),
@@ -30,7 +35,7 @@ export function useFileDownload({
     () => workspaceId?.trim() || normalizedWorkspaceRoot,
     [normalizedWorkspaceRoot, workspaceId],
   );
-  const { requestFileDownloadToken } = useFileExplorerActions({
+  const { requestFileDownloadToken, readFile } = useFileExplorerActions({
     serverId,
     workspaceId,
     workspaceRoot: normalizedWorkspaceRoot,
@@ -38,7 +43,7 @@ export function useFileDownload({
   const startDownload = useDownloadStore((state) => state.startDownload);
 
   return useCallback(
-    ({ fileName, path }) => {
+    ({ fileName, path, destination }) => {
       if (!workspaceScopeId) {
         return;
       }
@@ -47,10 +52,13 @@ export function useFileDownload({
         scopeId: workspaceScopeId,
         fileName,
         path,
+        destination,
         daemonProfile,
-        requestFileDownloadToken: (targetPath) => requestFileDownloadToken(targetPath),
+        activeConnectionId: getHostRuntimeStore().getSnapshot(serverId)?.activeConnectionId ?? null,
+        requestFileDownloadToken,
+        readFile,
       });
     },
-    [daemonProfile, requestFileDownloadToken, serverId, startDownload, workspaceScopeId],
+    [daemonProfile, readFile, requestFileDownloadToken, serverId, startDownload, workspaceScopeId],
   );
 }

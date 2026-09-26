@@ -460,6 +460,7 @@ export const en = {
       copyRelativePath: "Copy relative path",
       revealIn: "Reveal in {{target}}",
       download: "Download",
+      saveToDevice: "Save to device",
       addToChat: "Add to chat",
       moreActions: "More actions",
       newFile: "New file",
@@ -1806,7 +1807,6 @@ export const en = {
   },
   downloads: {
     requestTokenFailed: "Failed to request download token.",
-    hostUnavailable: "Download host is unavailable.",
     cancelled: "Download was cancelled.",
     failed: "Failed to download file.",
     shareFile: "Share file",

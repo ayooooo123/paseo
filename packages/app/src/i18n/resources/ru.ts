@@ -468,6 +468,7 @@ export const ru: TranslationResources = {
       copyRelativePath: "Копировать относительный путь",
       revealIn: "Показать в {{target}}",
       download: "Скачать",
+      saveToDevice: "Сохранить на устройство",
       addToChat: "Добавить в чат",
       moreActions: "Дополнительные действия",
       newFile: "Новый файл",
@@ -1813,7 +1814,6 @@ export const ru: TranslationResources = {
   },
   downloads: {
     requestTokenFailed: "Не удалось запросить токен загрузки.",
-    hostUnavailable: "Хост загрузки недоступен.",
     cancelled: "Загрузка отменена.",
     failed: "Не удалось загрузить файл.",
     shareFile: "Поделиться файлом",

@@ -463,6 +463,7 @@ export const zhCN: TranslationResources = {
       copyRelativePath: "复制相对路径",
       revealIn: "在 {{target}} 中显示",
       download: "下载",
+      saveToDevice: "保存到设备",
       addToChat: "添加到聊天",
       moreActions: "更多操作",
       newFile: "新建文件",
@@ -1760,7 +1761,6 @@ export const zhCN: TranslationResources = {
   },
   downloads: {
     requestTokenFailed: "请求下载 token 失败。",
-    hostUnavailable: "下载 Host 不可用。",
     cancelled: "下载已取消。",
     failed: "下载文件失败。",
     shareFile: "共享文件",

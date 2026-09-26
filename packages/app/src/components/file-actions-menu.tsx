@@ -8,6 +8,7 @@ import {
   ExternalLink,
   FilePlus,
   FileText,
+  FolderDown,
   FolderMinus,
   FolderOpen,
   FolderPlus,
@@ -18,6 +19,8 @@ import {
   type LucideIcon,
 } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
+import { isNative } from "@/constants/platform";
+import type { DownloadDestination } from "@/stores/download-store";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import {
   ContextMenuContent,
@@ -59,7 +62,8 @@ interface FileActionsContextMenuContentProps {
   onCopyRelativePath?: () => void;
   onReveal?: () => void;
   revealTargetName?: string;
-  onDownload?: () => void;
+  /** Web and the share sheet use "share"; native also offers "device" (a picked folder). */
+  onDownload?: (destination: DownloadDestination) => void;
   onAddToChat?: () => void;
   onNewFile?: () => void;
   onNewFolder?: () => void;
@@ -111,6 +115,31 @@ export function FileActionsContextMenuContent({
         : null,
     [editorTargetName, fileKind, onOpenInEditor, t],
   );
+  const downloadActions = useMemo<FileAction[]>(() => {
+    if (fileKind !== "file" || !fileExists || !onDownload) {
+      return [];
+    }
+    const share: FileAction = {
+      key: "download",
+      group: "reference",
+      label: t("workspace.fileActions.download"),
+      icon: Download,
+      onSelect: () => onDownload("share"),
+    };
+    if (!isNative) {
+      return [share];
+    }
+    return [
+      share,
+      {
+        key: "save-to-device",
+        group: "reference",
+        label: t("workspace.fileActions.saveToDevice"),
+        icon: FolderDown,
+        onSelect: () => onDownload("device"),
+      },
+    ];
+  }, [fileExists, fileKind, onDownload, t]);
   const actions = useMemo<FileAction[]>(() => {
     const availableFile = fileKind === "file" && fileExists;
     const specs: Array<FileAction | null> = [
@@ -184,15 +213,7 @@ export function FileActionsContextMenuContent({
             onSelect: onReveal,
           }
         : null,
-      availableFile && onDownload
-        ? {
-            key: "download",
-            group: "reference",
-            label: t("workspace.fileActions.download"),
-            icon: Download,
-            onSelect: onDownload,
-          }
-        : null,
+      ...downloadActions,
       availableFile && onAddToChat
         ? {
             key: "add-to-chat",
@@ -256,7 +277,7 @@ export function FileActionsContextMenuContent({
     onCopyPath,
     onCopyRelativePath,
     onDelete,
-    onDownload,
+    downloadActions,
     onDuplicate,
     onNewFile,
     onNewFolder,

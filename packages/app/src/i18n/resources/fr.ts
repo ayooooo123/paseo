@@ -469,6 +469,7 @@ export const fr: TranslationResources = {
       copyRelativePath: "Copier le chemin relatif",
       revealIn: "Afficher dans {{target}}",
       download: "Télécharger",
+      saveToDevice: "Enregistrer sur l'appareil",
       addToChat: "Ajouter au chat",
       moreActions: "Plus de propositions",
       newFile: "Nouveau fichier",
@@ -1833,7 +1834,6 @@ export const fr: TranslationResources = {
   },
   downloads: {
     requestTokenFailed: "Échec de la demande du jeton de téléchargement.",
-    hostUnavailable: "L'hôte de téléchargement n'est pas disponible.",
     cancelled: "Le téléchargement a été annulé.",
     failed: "Échec du téléchargement du fichier.",
     shareFile: "Partager un fichier",

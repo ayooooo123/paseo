@@ -468,6 +468,7 @@ export const ptBR: TranslationResources = {
       copyRelativePath: "Copiar caminho relativo",
       revealIn: "Mostrar no {{target}}",
       download: "Baixar",
+      saveToDevice: "Salvar no dispositivo",
       addToChat: "Adicionar ao chat",
       moreActions: "Mais ações",
       newFile: "Novo arquivo",
@@ -1814,7 +1815,6 @@ export const ptBR: TranslationResources = {
   },
   downloads: {
     requestTokenFailed: "Falha ao solicitar token de download.",
-    hostUnavailable: "Host de download indisponível.",
     cancelled: "Download cancelado.",
     failed: "Falha ao baixar arquivo.",
     shareFile: "Compartilhar arquivo",

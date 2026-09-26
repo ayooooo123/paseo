@@ -469,6 +469,7 @@ export const ja: TranslationResources = {
       copyRelativePath: "相対パスをコピー",
       revealIn: "{{target}}で表示",
       download: "ダウンロード",
+      saveToDevice: "デバイスに保存",
       addToChat: "チャットに追加",
       moreActions: "その他のアクション",
       newFile: "新規ファイル",
@@ -1800,7 +1801,6 @@ export const ja: TranslationResources = {
   },
   downloads: {
     requestTokenFailed: "ダウンロードトークンのリクエストに失敗しました。",
-    hostUnavailable: "ダウンロードホストが利用できません。",
     cancelled: "ダウンロードがキャンセルされました。",
     failed: "ファイルのダウンロードに失敗しました。",
     shareFile: "ファイルを共有",

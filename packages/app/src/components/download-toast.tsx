@@ -6,7 +6,8 @@ import { Pressable, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { Check, X, XCircle } from "lucide-react-native";
-import { useDownloadStore, formatSpeed, formatEta, type Download } from "@/stores/download-store";
+import { formatSpeed, formatEta, type Download } from "@/stores/download-store";
+import { useDownloadStore } from "@/stores/use-download-store";
 
 const AUTO_DISMISS_DELAY = 3000;
 

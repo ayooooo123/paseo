@@ -26,6 +26,7 @@ import { EditingTextInput as TextInput } from "@/components/ui/text-input";
 import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isWeb } from "@/constants/platform";
+import type { DownloadDestination } from "@/stores/download-store";
 import * as Clipboard from "expo-clipboard";
 import { ChevronDown, Eye, EyeOff, FilePlus, FolderPlus, RotateCw } from "lucide-react-native";
 import { MaterialFileIcon } from "@/components/material-file-icon";
@@ -118,7 +119,7 @@ interface TreeRowItemProps {
   editorTargetName?: string;
   onRevealEntry?: (entry: ExplorerEntry) => void;
   revealTargetName?: string;
-  onDownloadEntry: (entry: ExplorerEntry) => void;
+  onDownloadEntry: (entry: ExplorerEntry, destination: DownloadDestination) => void;
   onAddToChat?: (path: string) => void;
   onOpenFileToSide?: (path: string) => void;
   onNewEntry?: (parentPath: string, kind: "file" | "directory") => void;
@@ -303,9 +304,12 @@ function TreeRowItem({
     onRevealEntry?.(entry);
   }, [onRevealEntry, entry]);
 
-  const handleDownload = useCallback(() => {
-    onDownloadEntry(entry);
-  }, [onDownloadEntry, entry]);
+  const handleDownload = useCallback(
+    (destination: DownloadDestination) => {
+      onDownloadEntry(entry, destination);
+    },
+    [onDownloadEntry, entry],
+  );
 
   const handleAddToChat = useCallback(() => {
     onAddToChat?.(entry.path);
@@ -629,11 +633,11 @@ export function FileExplorerPane({
   );
 
   const handleDownloadEntry = useCallback(
-    (entry: ExplorerEntry) => {
+    (entry: ExplorerEntry, destination: DownloadDestination) => {
       if (entry.kind !== "file") {
         return;
       }
-      downloadFile({ fileName: entry.name, path: entry.path });
+      downloadFile({ fileName: entry.name, path: entry.path, destination });
     },
     [downloadFile],
   );
@@ -1479,7 +1483,7 @@ function TreeRowDispatcher({
   editorTargetName?: string;
   onRevealEntry?: (entry: ExplorerEntry) => void;
   revealTargetName?: string;
-  onDownloadEntry: (entry: ExplorerEntry) => void;
+  onDownloadEntry: (entry: ExplorerEntry, destination: DownloadDestination) => void;
   onAddToChat?: (path: string) => void;
   onOpenFileToSide?: (path: string) => void;
   onNewEntry?: (parentPath: string, kind: "file" | "directory") => void;
