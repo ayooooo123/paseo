@@ -992,6 +992,16 @@ const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
 const LIVENESS_HEARTBEAT_INTERVAL_MS = 10_000;
 const LIVENESS_HEARTBEAT_TIMEOUT_MS = 15_000;
 const LIVENESS_FAILURE_RECONNECT_THRESHOLD = 2;
+/**
+ * Upload bytes the client may have sent before the daemon confirms receiving
+ * the window before them. Transports queue sends without limit (the P2P Bare
+ * worker, relay sockets, RN WebSocket), so an unpaced upload parks the whole
+ * file ahead of pings and RPCs on a slow link, and the next liveness check
+ * tears the connection down mid-upload. Two windows stay in flight.
+ */
+const UPLOAD_ACK_WINDOW_BYTES = 512 * 1024;
+/** The first upload attempt plus restarts after the connection comes back. */
+const UPLOAD_MAX_ATTEMPTS = 3;
 
 /** Default timeout for waiting for connection before sending queued messages */
 const DEFAULT_SEND_QUEUE_TIMEOUT_MS = DEFAULT_SESSION_RPC_TIMEOUT_MS;
@@ -1541,6 +1551,43 @@ export class DaemonClient {
     return () => {
       this.connectionListeners.delete(listener);
     };
+  }
+
+  /**
+   * Resolves once the client is connected. Waits through `connecting` and
+   * through a disconnect the client will redial; rejects when no connection is
+   * coming or none arrives within `timeoutMs`.
+   */
+  private waitForConnection(timeoutMs: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const listener = (state: ConnectionState): void => {
+        if (state.status === "connected" && this.transport) {
+          this.connectionListeners.delete(listener);
+          clearTimeout(timeoutHandle);
+          resolve();
+          return;
+        }
+        const redialling =
+          state.status === "connecting" ||
+          (state.status === "disconnected" &&
+            this.shouldReconnect &&
+            this.config.reconnect?.enabled !== false);
+        if (redialling) return;
+        this.connectionListeners.delete(listener);
+        clearTimeout(timeoutHandle);
+        reject(new DaemonConnectionError(`Transport not connected (status: ${state.status})`));
+      };
+      this.connectionListeners.add(listener);
+      listener(this.connectionState);
+      if (!this.connectionListeners.has(listener)) return;
+      timeoutHandle = setTimeout(() => {
+        this.connectionListeners.delete(listener);
+        reject(
+          new DaemonConnectionError("Timed out waiting for connection", "DAEMON_REQUEST_TIMEOUT"),
+        );
+      }, timeoutMs);
+    });
   }
 
   get isConnected(): boolean {
@@ -4796,9 +4843,35 @@ export class DaemonClient {
     if (!bytes) {
       throw new Error("File bytes are required.");
     }
+    const requestId = this.createRequestId(input.requestId);
+    // Mobile file pickers background the app, and backgrounding drops a P2P
+    // connection, so an upload often starts while the client is redialling, and
+    // a slow link can drop mid-transfer. The daemon cancels a partial upload with
+    // its connection, so each attempt starts over on the live connection.
+    for (let attempt = 1; ; attempt += 1) {
+      await this.waitForConnection(DEFAULT_SEND_QUEUE_TIMEOUT_MS);
+      const attemptTransport = this.transport;
+      try {
+        return await this.sendFileUpload(input, bytes, requestId);
+      } catch (error) {
+        const retryable =
+          attempt < UPLOAD_MAX_ATTEMPTS &&
+          this.shouldReconnect &&
+          this.config.reconnect?.enabled !== false &&
+          (this.transport !== attemptTransport || this.connectionState.status !== "connected");
+        if (!retryable) throw error;
+      }
+    }
+  }
+
+  private async sendFileUpload(
+    input: FileUploadInput,
+    bytes: Uint8Array,
+    resolvedRequestId: string,
+  ): Promise<FileUploadResult> {
     const uploadTransport = this.transport;
-    const resolvedRequestId = this.createRequestId(input.requestId);
     const modifiedAt = input.modifiedAt ?? new Date().toISOString();
+    const ackRequestIdPrefix = `${resolvedRequestId}:ack:`;
     const responsePromise = this.sendCorrelatedRequest({
       requestId: resolvedRequestId,
       message: {
@@ -4811,6 +4884,9 @@ export class DaemonClient {
       },
       responseType: "file.upload.response",
       options: { skipQueue: true },
+      // A large file on a slow link outlasts any fixed deadline; each ack proves progress.
+      refreshDeadlineOn: (msg) =>
+        msg.type === "pong" && msg.payload.requestId.startsWith(ackRequestIdPrefix),
     });
 
     let settled = false;
@@ -4840,21 +4916,42 @@ export class DaemonClient {
       );
 
       const chunkSize = input.chunkSize ?? 128 * 1024;
+      let unackedBytes = 0;
+      let ackCount = 0;
+      let ack: Promise<Error | null> | null = null;
       for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
         // Native WebSocket.send encodes binary synchronously. Let rendering and
         // incoming messages run between bounded pieces on every platform.
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        // A pong comes back only after the daemon has read every byte sent
+        // before its ping, so waiting on the previous window's ack bounds what
+        // sits in transport buffers ahead of liveness pings and RPCs.
+        const ackError = unackedBytes >= UPLOAD_ACK_WINDOW_BYTES ? await ack : null;
         if (settled) return await responsePromise;
         if (this.transport !== uploadTransport || this.connectionState.status !== "connected") {
           throw new DaemonConnectionError("Connection changed during file upload");
         }
+        if (ackError) throw ackError;
+        if (unackedBytes >= UPLOAD_ACK_WINDOW_BYTES) {
+          ackCount += 1;
+          ack = this.ping({
+            requestId: `${ackRequestIdPrefix}${ackCount}`,
+            timeoutMs: DEFAULT_SESSION_RPC_TIMEOUT_MS,
+          }).then(
+            () => null,
+            (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+          );
+          unackedBytes = 0;
+        }
+        const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.byteLength));
         this.sendBinaryFrame(
           encodeFileTransferFrame({
             opcode: FileTransferOpcode.FileChunk,
             requestId: resolvedRequestId,
-            payload: bytes.subarray(offset, Math.min(offset + chunkSize, bytes.byteLength)),
+            payload: chunk,
           }),
         );
+        unackedBytes += chunk.byteLength;
       }
 
       this.sendBinaryFrame(

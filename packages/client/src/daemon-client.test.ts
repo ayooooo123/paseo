@@ -7012,6 +7012,174 @@ test("uploadFile stops sending chunks when the connection closes between sends",
   ).toBe(false);
 });
 
+test("uploadFile holds file bytes until the daemon acknowledges what it already sent", async () => {
+  vi.useFakeTimers();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "upload-paced",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen();
+  await connection;
+
+  const fileBytes = 4 * 1024 * 1024;
+  const upload = client.uploadFile({
+    fileName: "video.mp4",
+    mimeType: "video/mp4",
+    bytes: new Uint8Array(fileBytes),
+    requestId: "req-video",
+  });
+  const binaryFrames = () =>
+    mock.sent
+      .filter((frame) => typeof frame !== "string")
+      .map(assertUint8Array)
+      .map(decodeFileTransferFrame);
+  const sentFileBytes = () =>
+    binaryFrames()
+      .filter((frame) => frame.opcode === FileTransferOpcode.FileChunk)
+      .reduce((total, frame) => total + frame.payload.byteLength, 0);
+  const acknowledged = new Set<string>();
+  const acknowledgePings = () => {
+    for (const frame of mock.sent) {
+      if (typeof frame !== "string") continue;
+      const parsed = JSON.parse(frame);
+      if (parsed.type !== "session" || parsed.message.type !== "ping") continue;
+      if (acknowledged.has(parsed.message.requestId)) continue;
+      acknowledged.add(parsed.message.requestId);
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "pong",
+          payload: {
+            requestId: parsed.message.requestId,
+            clientSentAt: parsed.message.clientSentAt,
+            serverReceivedAt: 1,
+            serverSentAt: 1,
+          },
+        }),
+      );
+    }
+  };
+
+  // Unacknowledged, the upload stalls instead of queueing the whole file.
+  await vi.advanceTimersByTimeAsync(1_000);
+  const stalledAt = sentFileBytes();
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(sentFileBytes()).toBe(stalledAt);
+  expect(stalledAt).toBeLessThan(fileBytes);
+  expect(binaryFrames().some((frame) => frame.opcode === FileTransferOpcode.FileEnd)).toBe(false);
+
+  for (let round = 0; round < 100; round++) {
+    if (binaryFrames().at(-1)?.opcode === FileTransferOpcode.FileEnd) break;
+    acknowledgePings();
+    await vi.advanceTimersByTimeAsync(10);
+  }
+  expect(binaryFrames().at(-1)?.opcode).toBe(FileTransferOpcode.FileEnd);
+  expect(sentFileBytes()).toBe(fileBytes);
+
+  const file = {
+    type: "uploaded_file",
+    id: "upload_req-video",
+    fileName: "video.mp4",
+    mimeType: "video/mp4",
+    size: fileBytes,
+    path: "/tmp/paseo-uploads/upload_req-video/video.mp4",
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "file.upload.response",
+      payload: { requestId: "req-video", file, error: null },
+    }),
+  );
+  await expect(upload).resolves.toEqual({ requestId: "req-video", file, error: null });
+});
+
+test("uploadFile waits out a redial and restarts on the next connection after a drop", async () => {
+  vi.useFakeTimers();
+  const transports = [createMockTransport(), createMockTransport(), createMockTransport()];
+  const [first, second, third] = transports;
+  let dials = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "upload-redial",
+    logger: createMockLogger(),
+    transportFactory: () => transports[dials++]!.transport,
+  });
+  clients.push(client);
+  const redial = async (expectedDials: number) => {
+    for (let step = 0; step < 600; step++) {
+      if (dials >= expectedDials) break;
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(dials).toBe(expectedDials);
+  };
+  const fileFrames = (mock: MockTransport) =>
+    mock.sent
+      .filter((frame) => typeof frame !== "string")
+      .map(assertUint8Array)
+      .map(decodeFileTransferFrame);
+  const connection = client.connect();
+  first!.triggerOpen();
+  await connection;
+
+  // The file picker backgrounded the app, which drops a P2P connection.
+  first!.triggerClose();
+  const fileBytes = 300 * 1024;
+  const upload = client.uploadFile({
+    fileName: "clip.mp4",
+    mimeType: "video/mp4",
+    bytes: new Uint8Array(fileBytes),
+    requestId: "req-clip",
+  });
+  let settled = false;
+  void upload.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+
+  await redial(2);
+  expect(settled).toBe(false);
+  second!.triggerOpen();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(fileFrames(second!).some((frame) => frame.opcode === FileTransferOpcode.FileChunk)).toBe(
+    true,
+  );
+  second!.triggerClose();
+
+  await redial(3);
+  expect(settled).toBe(false);
+  third!.triggerOpen();
+  await vi.advanceTimersByTimeAsync(100);
+  const frames = fileFrames(third!);
+  expect(frames[0]?.opcode).toBe(FileTransferOpcode.FileBegin);
+  expect(frames.at(-1)?.opcode).toBe(FileTransferOpcode.FileEnd);
+  expect(
+    frames
+      .filter((frame) => frame.opcode === FileTransferOpcode.FileChunk)
+      .reduce((total, frame) => total + frame.payload.byteLength, 0),
+  ).toBe(fileBytes);
+
+  const file = {
+    type: "uploaded_file",
+    id: "upload_req-clip",
+    fileName: "clip.mp4",
+    mimeType: "video/mp4",
+    size: fileBytes,
+    path: "/tmp/paseo-uploads/upload_req-clip/clip.mp4",
+  };
+  third!.triggerMessage(
+    wrapSessionMessage({
+      type: "file.upload.response",
+      payload: { requestId: "req-clip", file, error: null },
+    }),
+  );
+  await expect(upload).resolves.toEqual({ requestId: "req-clip", file, error: null });
+});
+
 test("rejects source installation on an older host before sending a request", async () => {
   const transport = createMockTransport();
   const client = new DaemonClient({
