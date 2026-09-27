@@ -11,6 +11,11 @@ export function assertPluginTimelineDataSize(data: JsonValue): void {
   }
 }
 
+// V8 `slice` can return a sliced string that keeps the whole source alive, so a 64 KiB prefix could pin megabytes of tool output for the life of the timeline.
+function truncateDetached(value: string, maxLength: number): string {
+  return JSON.parse(JSON.stringify(value.slice(0, maxLength))) as string;
+}
+
 function limitFailedShellError(item: AgentTimelineItem): AgentTimelineItem {
   if (
     item.type !== "tool_call" ||
@@ -28,7 +33,7 @@ function limitFailedShellError(item: AgentTimelineItem): AgentTimelineItem {
     ...item,
     error: {
       ...item.error,
-      content: item.error.content.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH),
+      content: truncateDetached(item.error.content, TOOL_CALL_CONTENT_MAX_LENGTH),
     },
   };
 }
@@ -46,7 +51,7 @@ function limitPlainText(item: AgentTimelineItem): AgentTimelineItem {
     ...item,
     detail: {
       ...item.detail,
-      text: item.detail.text.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH),
+      text: truncateDetached(item.detail.text, TOOL_CALL_CONTENT_MAX_LENGTH),
     },
   };
 }
@@ -68,7 +73,7 @@ export function limitAgentTimelineItemContent(item: AgentTimelineItem): AgentTim
     ...item,
     detail: {
       ...item.detail,
-      output: item.detail.output.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH),
+      output: truncateDetached(item.detail.output, TOOL_CALL_CONTENT_MAX_LENGTH),
     },
   };
 }
