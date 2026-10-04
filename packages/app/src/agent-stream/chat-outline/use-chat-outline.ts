@@ -3,7 +3,6 @@ import type { AgentTimelinePromptIndexPayload } from "@getpaseo/client/internal/
 import { isWeb } from "@/constants/platform";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
-import { isDraftAgentId } from "@/stores/draft-keys";
 import { planTimelinePromptJump } from "@/timeline/timeline-sync-plan";
 import type { StreamItem } from "@/types/stream";
 import type { StreamViewportHandle } from "../strategy";
@@ -78,11 +77,10 @@ export function useChatOutline({
 
   useEffect(() => setIndex(null), [agentId, enabled, serverId, timelineEpoch]);
 
+  // Only a timeline the daemon has served can be indexed. A draft's optimistic stream has no
+  // epoch, and its id names no agent the daemon knows.
   useEffect(() => {
-    // A draft chat has no agent on the daemon yet, so a prompt index for it
-    // cannot exist. Asking anyway logs a daemon-side error for a request that
-    // could never have succeeded.
-    if (!isWeb || !enabled || isDraftAgentId(agentId)) {
+    if (!isWeb || !enabled || timelineEpoch === null) {
       setIndex(null);
       return;
     }

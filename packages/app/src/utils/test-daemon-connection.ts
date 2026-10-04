@@ -1,4 +1,9 @@
-import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import {
+  DaemonAuthenticationError,
+  DaemonClient,
+  getDaemonAuthFailureReason,
+  type DaemonAuthFailureReason,
+} from "@getpaseo/client/internal/daemon-client";
 import type { DaemonClientConfig } from "@getpaseo/client/internal/daemon-client";
 import type { HostConnection } from "@/types/host-connection";
 import { getOrCreateClientId } from "./client-id";
@@ -18,6 +23,7 @@ import type { DesktopDaemonTransportTarget } from "@/desktop/daemon/desktop-daem
 
 export interface DaemonProbeClient {
   readonly lastError: string | null;
+  readonly authFailureReason?: DaemonAuthFailureReason | null;
   connect(): Promise<void>;
   close(): Promise<void>;
   getLastServerInfoMessage(): { serverId: string; hostname: string | null } | null;
@@ -86,32 +92,24 @@ function pickBestReason(reason: string | null, lastError: string | null): string
   return "Unable to connect";
 }
 
-function isIncorrectPasswordFailure(input: {
-  config: DaemonClientConfig;
-  reason: string | null;
-  lastError: string | null;
-}): boolean {
-  if (!input.config.password) {
-    return false;
-  }
-  const details = [input.reason, input.lastError].filter(Boolean).join("\n").toLowerCase();
-  return (
-    details.includes("401") ||
-    details.includes("4001") ||
-    details.includes("unauthorized") ||
-    details.includes("code 1006")
-  );
-}
-
 export class DaemonConnectionTestError extends Error {
   reason: string | null;
   lastError: string | null;
+  authFailureReason: DaemonAuthFailureReason | null;
 
-  constructor(message: string, details: { reason: string | null; lastError: string | null }) {
+  constructor(
+    message: string,
+    details: {
+      reason: string | null;
+      lastError: string | null;
+      authFailureReason?: DaemonAuthFailureReason | null;
+    },
+  ) {
     super(message);
     this.name = "DaemonConnectionTestError";
     this.reason = details.reason;
     this.lastError = details.lastError;
+    this.authFailureReason = details.authFailureReason ?? null;
   }
 }
 
@@ -135,12 +133,32 @@ function buildHyperdhtClientConfig(
   };
 }
 
+export function getConnectionAuthFailureReason(error: unknown): DaemonAuthFailureReason | null {
+  if (error instanceof DaemonConnectionTestError) return error.authFailureReason;
+  return getDaemonAuthFailureReason(error);
+}
+
+function resolveConnectionCredentials(
+  connection: HostConnection,
+  options:
+    | { password?: string; localCredential?: DaemonClientConfig["localCredential"] }
+    | undefined,
+): Pick<DaemonClientConfig, "password" | "localCredential"> {
+  const password = options?.password;
+  return {
+    ...(password ? { password } : {}),
+    ...(options?.localCredential ? { localCredential: options.localCredential } : {}),
+  };
+}
+
 export async function buildClientConfig(
   connection: HostConnection,
   serverId?: string,
   options?: {
     capabilities?: DaemonClientConfig["capabilities"];
     trace?: DaemonClientConfig["trace"];
+    password?: string;
+    localCredential?: DaemonClientConfig["localCredential"];
   },
   deps: Pick<
     DaemonConnectionDependencies<DaemonProbeClient>,
@@ -158,6 +176,7 @@ export async function buildClientConfig(
     appVersion: deps.resolveAppVersion() ?? undefined,
     suppressSendErrors: true,
     reconnect: { enabled: false },
+    ...resolveConnectionCredentials(connection, options),
     ...(options?.capabilities ? { capabilities: options.capabilities } : {}),
     ...(options?.trace ? { trace: options.trace } : {}),
     ...((connection.type === "directSocket" || connection.type === "directPipe") &&
@@ -189,7 +208,6 @@ export async function buildClientConfig(
     return {
       ...base,
       url: buildDaemonWebSocketUrl(connection.endpoint, { useTls: connection.useTls ?? false }),
-      ...(connection.password ? { password: connection.password } : {}),
     };
   }
 
@@ -271,11 +289,13 @@ export function connectAndProbe(
             error instanceof Error ? error.message : String(error),
           );
           const lastError = normalizeNonEmptyString(client.lastError);
-          const message = isIncorrectPasswordFailure({ config, reason, lastError })
-            ? "Incorrect password"
+          const authFailureReason =
+            getDaemonAuthFailureReason(error) ?? client.authFailureReason ?? null;
+          const message = authFailureReason
+            ? new DaemonAuthenticationError(authFailureReason).message
             : pickBestReason(reason, lastError);
           void client.close().catch(() => undefined);
-          reject(new DaemonConnectionTestError(message, { reason, lastError }));
+          reject(new DaemonConnectionTestError(message, { reason, lastError, authFailureReason }));
         });
     },
   );
@@ -284,6 +304,8 @@ export function connectAndProbe(
 interface ProbeOptions {
   serverId?: string;
   timeoutMs?: number;
+  password?: string;
+  localCredential?: DaemonClientConfig["localCredential"];
   capabilities?: DaemonClientConfig["capabilities"];
   trace?: DaemonClientConfig["trace"];
 }

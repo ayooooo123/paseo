@@ -1,5 +1,8 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   AgentSideConnection,
@@ -819,6 +822,46 @@ describe("mapACPUsage", () => {
       outputTokens: 7,
       cachedInputTokens: 5,
     });
+  });
+});
+
+describe("ACP context-window usage", () => {
+  async function emitUsageUpdate(update: {
+    used: number;
+    size: number;
+  }): Promise<{ events: unknown[] }> {
+    const session = createSessionWithConfig({ provider: "dsh" });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    const events: unknown[] = [];
+    session.subscribe((event) => {
+      if (event.type === "usage_updated") events.push(event);
+    });
+    await session.sessionUpdate({
+      sessionId: "session-1",
+      update: { sessionUpdate: "usage_update", used: update.used, size: update.size },
+    });
+    return { events };
+  }
+
+  test("forwards usage_update as context-window usage state", async () => {
+    const { events } = await emitUsageUpdate({ used: 13_759, size: 1_000_000 });
+
+    expect(events).toEqual([
+      {
+        type: "usage_updated",
+        provider: "dsh",
+        usage: { contextWindowMaxTokens: 1_000_000, contextWindowUsedTokens: 13_759 },
+      },
+    ]);
+  });
+
+  test("emits nothing when size and used cannot both drive a meter", async () => {
+    await expect(
+      emitUsageUpdate({ used: -1, size: 0 }).then((result) => result.events),
+    ).resolves.toEqual([]);
+    await expect(
+      emitUsageUpdate({ used: 13_759, size: 0 }).then((result) => result.events),
+    ).resolves.toEqual([]);
   });
 });
 
@@ -3521,6 +3564,34 @@ describe("ACPAgentSession close() tree-kill", () => {
 });
 
 describe("ACPAgentSession initialization cleanup", () => {
+  test("rejects a resume whose working directory was deleted instead of crashing", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "paseo-acp-deleted-cwd-"));
+    const deletedCwd = path.join(root, "worktree");
+    const terminator = new FakeTerminator();
+    const session = new ACPAgentSession(
+      { provider: "test-acp", cwd: deletedCwd },
+      {
+        provider: "test-acp",
+        logger: createTestLogger(),
+        defaultCommand: [process.execPath, "-e", "process.stdin.resume()"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+        },
+        handle: { provider: "test-acp", sessionId: "archived-session" },
+        terminateProcess: terminator.terminate,
+      },
+    );
+
+    try {
+      await expect(session.initializeResumedSession()).rejects.toThrow("ENOENT");
+      expect(terminator.terminated).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("terminates the ACP process when session/new fails", async () => {
     const terminator = new FakeTerminator();
     const child = createProbeChildStub();

@@ -3,6 +3,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import equal from "fast-deep-equal/es6";
 import {
   DaemonClient,
+  DaemonAuthenticationError,
   type DaemonClientConfig,
   type ConnectionState,
   type FetchAgentsOptions,
@@ -13,8 +14,10 @@ import {
   normalizeStoredHostProfile,
   upsertHostConnectionInProfiles,
   registryHasConnection,
+  relayConnectionFromOffer,
   StoredHostRegistrySchema,
   hyperdhtConnectionFromInvite,
+  isHyperdhtInvite,
   type HostConnection,
   type HostProfile,
 } from "@/types/host-connection";
@@ -24,13 +27,15 @@ import {
   buildRelayWebSocketUrl,
   decodeOfferFragmentPayload,
   normalizeHostPort,
+  parseRelayConnectionUri,
   shouldUseTlsForDefaultHostedRelay,
 } from "@/utils/daemon-endpoints";
 import { resolveAppVersion } from "@/utils/app-version";
 import { ConnectionOfferSchema, type ConnectionOffer } from "@getpaseo/protocol/connection-offer";
+import { HostConfirmations, type HostConfirmationRequest } from "./host-confirmation";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { isWeb } from "@/constants/platform";
-import { connectToDaemon } from "@/utils/test-daemon-connection";
+import { connectToDaemon, getConnectionAuthFailureReason } from "@/utils/test-daemon-connection";
 import { getOrCreateClientId } from "@/utils/client-id";
 import { z } from "zod";
 import { readValidatedJson, readValidatedString } from "@/storage/validated-storage";
@@ -46,10 +51,12 @@ import {
   createDesktopDaemonTransportFactory,
 } from "@/desktop/daemon/desktop-daemon-transport";
 import { getDesktopHost } from "@/desktop/host";
+import { readDesktopManagedLocalCredential } from "@/desktop/daemon/local-credential";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
   useSessionStore,
+  toDaemonServerInfo,
   type Agent,
   type WorkspaceDescriptor,
   type ProjectDescriptor,
@@ -85,7 +92,29 @@ import { revokePushNotifications } from "@/push-notifications";
 import { createAppWebSocketFactory } from "./websocket-factory";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
+export type PairingNavigationTarget = "openProject" | "hostRoot" | "hostSettings";
 export type HostRegistryStatus = "loading" | "ready";
+
+/** One pairing flow started with `HostRuntimeStore.beginLinkPairing`. */
+export interface LinkPairing {
+  /** Probes the linked host and saves it. Connection and password errors throw. */
+  submit(link: string, password?: string): Promise<LinkPairingResult>;
+}
+
+export type LinkPairingResult =
+  | { status: "connected"; profile: HostProfile; serverId: string; hostname: string | null }
+  | { status: "cancelled" };
+
+/** A pairing link the user confirmed whose host then asked for a password. */
+export interface PasswordRequiredPairing {
+  link: string;
+  pairing: LinkPairing;
+}
+
+export type ConnectionLinkImport =
+  | { status: "connected"; serverId: string }
+  | ({ status: "password_required" } & PasswordRequiredPairing)
+  | { status: "cancelled" };
 
 export type ActiveConnection =
   | { type: "directTcp"; endpoint: string; display: string }
@@ -110,6 +139,7 @@ export interface HostRuntimeSnapshot {
   connectionStatus: HostRuntimeConnectionStatus;
   client: DaemonClient | null;
   lastError: string | null;
+  authFailureReason?: "password_required" | "incorrect_password" | null;
   lastOnlineAt: string | null;
   agentDirectoryStatus: HostRuntimeAgentDirectoryStatus;
   agentDirectoryError: string | null;
@@ -528,6 +558,8 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
         capabilities: appCapabilities,
         trace: nativePerformanceTrace,
         providerSnapshots: "wire",
+        ...(host.password ? { password: host.password } : {}),
+        localCredential: () => readDesktopManagedLocalCredential(connection),
       } satisfies Omit<DaemonClientConfig, "url">;
       if (connection.type === "directSocket" || connection.type === "directPipe") {
         return new DaemonClient({
@@ -561,7 +593,6 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
           url: buildDaemonWebSocketUrl(connection.endpoint, {
             useTls: connection.useTls ?? false,
           }),
-          ...(connection.password ? { password: connection.password } : {}),
         });
       }
       if (connection.type === "hyperdht") {
@@ -600,6 +631,8 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
     connectToDaemon: ({ host, connection, timeoutMs }) =>
       connectToDaemon(connection, {
         ...(host.serverId ? { serverId: host.serverId } : {}),
+        ...(host.password ? { password: host.password } : {}),
+        localCredential: () => readDesktopManagedLocalCredential(connection),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         capabilities: appCapabilities,
         trace: nativePerformanceTrace,
@@ -647,6 +680,7 @@ export class HostRuntimeController {
   private switchRequestVersion = 0;
   private probeRequestVersion = 0;
   private probeCycleInFlight: Promise<void> | null = null;
+  private readonly authRejectedConnectionIds = new Set<string>();
 
   constructor(input: {
     host: HostProfile;
@@ -697,8 +731,15 @@ export class HostRuntimeController {
         connectionId: options.initialConnection.connectionId,
         existingClient: options.initialConnection.existingClient,
       });
+      if (!this.started) {
+        return;
+      }
     }
     await this.runProbeCycleNow();
+    // stop() can run while startup is pending; a stopped controller never probes again.
+    if (!this.started) {
+      return;
+    }
     if (options?.autoProbe !== false) {
       this.probeIntervalHandle = setInterval(() => {
         void this.runProbeCycleNow();
@@ -735,6 +776,12 @@ export class HostRuntimeController {
   }
 
   async updateHost(host: HostProfile): Promise<void> {
+    const passwordChanged = this.host.password !== host.password;
+    if (passwordChanged) {
+      this.probeRequestVersion += 1;
+      this.authRejectedConnectionIds.clear();
+      this.updateSnapshot({ authFailureReason: null });
+    }
     const activeConnectionId = this.snapshot.activeConnectionId;
     const previousActiveConnection = findConnectionById(this.host, activeConnectionId);
     this.host = host;
@@ -744,11 +791,13 @@ export class HostRuntimeController {
       activeConnectionId &&
       previousActiveConnection &&
       nextActiveConnection &&
-      !equal(previousActiveConnection, nextActiveConnection)
+      (!equal(previousActiveConnection, nextActiveConnection) || passwordChanged)
     ) {
       this.connectionLastProbedAt.delete(activeConnectionId);
       await this.switchToConnection({ connectionId: activeConnectionId });
     }
+    if (passwordChanged) this.connectionLastProbedAt.clear();
+    if (passwordChanged) await this.probeCycleInFlight;
     await this.runProbeCycleNow();
   }
 
@@ -838,6 +887,7 @@ export class HostRuntimeController {
     const hasActiveOnlineConnection = isOnline && activeConnectionId !== null;
 
     const connectionsToProbe = this.host.connections.filter((connection) => {
+      if (this.authRejectedConnectionIds.has(connection.id)) return false;
       const lastProbed = this.connectionLastProbedAt.get(connection.id);
       if (lastProbed == null) {
         return true;
@@ -873,6 +923,7 @@ export class HostRuntimeController {
     this.updateSnapshot({ probeByConnectionId: new Map(probeByConnectionId) });
 
     let remaining = connectionsToProbe.length;
+    let probeAuthFailure: "password_required" | "incorrect_password" | null = null;
     let activationLock: Promise<void> | null = null;
 
     const publishProbeState = (): void => {
@@ -923,11 +974,18 @@ export class HostRuntimeController {
             connectionId: nextConnectionId,
             expectedProbeVersion: requestVersion,
           });
+        } else if (probeAuthFailure) {
+          const message = new DaemonAuthenticationError(probeAuthFailure).message;
+          this.applyConnectionEvent({ type: "connect_failed", message });
+          this.updateSnapshot({
+            ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
+            authFailureReason: probeAuthFailure,
+          });
         }
         return;
       }
 
-      if (activeProbe?.status === "unavailable") {
+      if (this.isConnectionUnavailable(currentActiveConnectionId, activeProbe)) {
         const nextConnectionId = selectBestConnection({
           candidates: buildConnectionCandidates(this.host),
           probeByConnectionId,
@@ -1059,8 +1117,13 @@ export class HostRuntimeController {
               latencyMs: rttMs,
             });
             publishProbeState();
-          } catch {
+          } catch (error) {
             if (this.isCurrentProbeRequest(requestVersion)) {
+              const authFailure = getConnectionAuthFailureReason(error);
+              if (authFailure) {
+                this.authRejectedConnectionIds.add(connection.id);
+                probeAuthFailure = authFailure;
+              }
               probeByConnectionId.set(connection.id, {
                 status: "unavailable",
                 latencyMs: null,
@@ -1076,6 +1139,13 @@ export class HostRuntimeController {
         })();
       }
     });
+  }
+
+  private isConnectionUnavailable(
+    connectionId: string,
+    probe: ConnectionProbeState | null | undefined,
+  ): boolean {
+    return probe?.status === "unavailable" || this.authRejectedConnectionIds.has(connectionId);
   }
 
   private updateSnapshot(patch: HostRuntimeSnapshotPatch): void {
@@ -1286,6 +1356,8 @@ export class HostRuntimeController {
 
     const failConnection = async (error: unknown) => {
       if (!this.isCurrentSwitchRequest(requestVersion) || this.activeClient !== client) return;
+      const authFailure = getConnectionAuthFailureReason(error);
+      if (authFailure) this.authRejectedConnectionIds.add(connection.id);
       this.unsubscribeClientStatus?.();
       this.unsubscribeClientStatus = null;
       this.unsubscribeClientHandlers?.();
@@ -1295,11 +1367,28 @@ export class HostRuntimeController {
       this.updateSnapshot({
         ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
         client: null,
+        authFailureReason: authFailure,
       });
+      if (authFailure) {
+        const probes = new Map(this.snapshot.probeByConnectionId);
+        probes.set(connection.id, { status: "unavailable", latencyMs: null });
+        this.updateSnapshot({ probeByConnectionId: probes });
+        for (const candidate of this.host.connections) {
+          if (!this.authRejectedConnectionIds.has(candidate.id)) {
+            this.connectionLastProbedAt.delete(candidate.id);
+          }
+        }
+      }
       try {
         await client.close();
       } catch {
         /* Preserve the compatibility/connection error. */
+      }
+      if (
+        authFailure &&
+        this.host.connections.some((candidate) => !this.authRejectedConnectionIds.has(candidate.id))
+      ) {
+        void this.runProbeCycleNow();
       }
     };
     try {
@@ -1309,11 +1398,16 @@ export class HostRuntimeController {
         this.deps.mountClientHandlers?.({ client, host: this.host, connection }) ?? null;
       this.unsubscribeClientStatus = client.subscribeConnectionStatus((state) => {
         if (!this.isCurrentSwitchRequest(requestVersion) || this.activeClient !== client) return;
+        if (client.authFailureReason) {
+          void failConnection(new DaemonAuthenticationError(client.authFailureReason));
+          return;
+        }
         this.applyConnectionEvent({ type: "client_state", state, lastError: client.lastError });
         this.updateSnapshot({
           ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
           ...this.buildAgentDirectoryStatusPatch(),
           client,
+          authFailureReason: null,
         });
       });
     } catch (error) {
@@ -1374,6 +1468,26 @@ function readConfiguredLocalDaemonOverride(): string | null {
   return value && value.length > 0 ? value : null;
 }
 
+function isSameLinkedConnection(left: ConnectionOffer, right: ConnectionOffer): boolean {
+  return (
+    left.serverId === right.serverId &&
+    equal(relayConnectionFromOffer(left), relayConnectionFromOffer(right))
+  );
+}
+
+function parseOfferConnectionUrl(input: string): { offer: ConnectionOffer; password?: string } {
+  if (input.trim().startsWith("relay://") || input.includes("#connect=")) {
+    return parseRelayConnectionUri(input);
+  }
+  const marker = "#offer=";
+  const idx = input.indexOf(marker);
+  if (idx === -1) throw new Error("Missing #offer= fragment");
+  const encoded = input.slice(idx + marker.length).trim();
+  if (!encoded) throw new Error("Offer payload is empty");
+  const payload = decodeOfferFragmentPayload(encoded);
+  return { offer: ConnectionOfferSchema.parse(payload) };
+}
+
 export function hasConfiguredLocalDaemonOverride(): boolean {
   return readConfiguredLocalDaemonOverride() !== null;
 }
@@ -1422,6 +1536,8 @@ export class HostRuntimeStore {
   private timelineReplicaByServer = new Map<string, TimelineReplica>();
   private configuredOverrideBootstrapInFlight: Promise<void> | null = null;
   private bootPromise: Promise<void> | null = null;
+  private registryLoad: Promise<void> | null = null;
+  private readonly hostConfirmations = new HostConfirmations();
   private storage: HostRuntimeStorage;
   private replicaCache: ReplicaCache;
   private readonly revokePushNotifications: typeof revokePushNotifications;
@@ -1472,8 +1588,7 @@ export class HostRuntimeStore {
 
   private async runBoot(): Promise<void> {
     const override = readConfiguredLocalDaemonOverride();
-    await this.loadFromStorage();
-    this.markHostRegistryLoaded();
+    await this.loadRegistry();
 
     let isE2E: string | null = null;
     try {
@@ -1506,6 +1621,13 @@ export class HostRuntimeStore {
     }
   }
 
+  private loadRegistry(): Promise<void> {
+    if (!this.registryLoad) {
+      this.registryLoad = this.loadFromStorage().then(() => this.markHostRegistryLoaded());
+    }
+    return this.registryLoad;
+  }
+
   private async loadFromStorage(): Promise<void> {
     let shouldPersistHosts = false;
     let profiles: HostProfile[] = [];
@@ -1523,6 +1645,14 @@ export class HostRuntimeStore {
             await this.storage.removeItem(REGISTRY_STORAGE_KEY);
             normalizedProfiles.length = 0;
             break;
+          }
+          // COMPAT(connectionPassword): added in v0.9.1, remove after 2027-03-24 with stored-password migration.
+          if (
+            entry.connections.some(
+              (connection) => connection.type === "directTcp" && connection.password,
+            )
+          ) {
+            shouldPersistHosts = true;
           }
           normalizedProfiles.push(profile);
         }
@@ -1746,12 +1876,12 @@ export class HostRuntimeStore {
     return this.upsertHostConnection({
       serverId: input.serverId,
       label: input.label,
+      password,
       connection: {
         id: `direct:${endpoint}`,
         type: "directTcp",
         endpoint,
         useTls: input.useTls ?? false,
-        ...(password ? { password } : {}),
       },
       existingClient: input.existingClient,
     });
@@ -1759,6 +1889,7 @@ export class HostRuntimeStore {
 
   async probeAndUpsertConnection(input: {
     connection: HostConnection;
+    password?: string;
     label?: string;
     timeoutMs?: number;
   }): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
@@ -1767,6 +1898,7 @@ export class HostRuntimeStore {
     }
     const probeHost: HostProfile = {
       serverId: "",
+      ...(input.password ? { password: input.password } : {}),
       label: input.label ?? input.connection.id,
       appearance: defaultHostAppearance(),
       lifecycle: {},
@@ -1783,6 +1915,7 @@ export class HostRuntimeStore {
     const profile = await this.upsertHostConnection({
       serverId,
       label: input.label ?? hostname ?? undefined,
+      password: input.password,
       connection: input.connection,
       existingClient: client,
     });
@@ -1799,12 +1932,12 @@ export class HostRuntimeStore {
     const password = input.password?.trim();
     return this.probeAndUpsertConnection({
       label: input.label,
+      password,
       connection: {
         id: `direct:${endpoint}`,
         type: "directTcp",
         endpoint,
         useTls: input.useTls ?? false,
-        ...(password ? { password } : {}),
       },
     });
   }
@@ -1821,12 +1954,13 @@ export class HostRuntimeStore {
     });
   }
 
-  async upsertRelayConnection(input: {
+  private async upsertRelayConnection(input: {
     serverId: string;
     relayEndpoint: string;
     useTls?: boolean;
     daemonPublicKeyB64: string;
     label?: string;
+    password?: string;
   }): Promise<HostProfile> {
     const relayEndpoint = normalizeHostPort(input.relayEndpoint);
     const useTls = input.useTls ?? false;
@@ -1835,7 +1969,7 @@ export class HostRuntimeStore {
       throw new Error("daemonPublicKeyB64 is required");
     }
     const explicitUseTls = input.useTls !== undefined;
-    return this.upsertHostConnection({
+    const profile = await this.upsertHostConnection({
       serverId: input.serverId,
       label: input.label,
       connection: {
@@ -1846,52 +1980,132 @@ export class HostRuntimeStore {
         daemonPublicKeyB64,
       },
     });
+    if (input.password) {
+      await this.setHostPassword(profile.serverId, input.password);
+      return this.hosts.find((host) => host.serverId === profile.serverId) ?? profile;
+    }
+    return profile;
   }
 
   /**
-   * Pair a HyperDHT host from a pasted/scanned `paseo-peer://` invite. Validates
-   * the invite, dials the daemon over the DHT to learn its serverId, then
-   * persists the host. Throws on a malformed invite or a failed probe.
+   * Pairs a HyperDHT host from a scanned or pasted `paseo-peer://` invite.
+   * Validates the invite, dials the daemon over the DHT to learn its serverId,
+   * then persists the host. Throws on a malformed invite or a failed probe.
    */
-  async upsertHyperdhtConnectionFromInvite(
+  private async upsertHyperdhtConnectionFromInvite(
     invite: string,
-    label?: string,
+    password: string | undefined,
   ): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
-    const connection = hyperdhtConnectionFromInvite(invite);
     return this.probeAndUpsertConnection({
-      connection,
-      ...(label !== undefined ? { label } : {}),
+      connection: hyperdhtConnectionFromInvite(invite),
+      ...(password ? { password } : {}),
     });
   }
 
-  async upsertConnectionFromOffer(offer: ConnectionOffer, label?: string): Promise<HostProfile> {
-    // COMPAT(oldRelayOfferTls): added in v0.1.73, remove after 2026-11-10.
-    const useTls = offer.relay.useTls ?? shouldUseTlsForDefaultHostedRelay(offer.relay.endpoint);
+  // A pairing link (a URL, a QR code, or a pasted link) asks the user to
+  // confirm when it adds a new host or changes a saved host's key, relay, or
+  // TLS setting. The answer needs the saved hosts, so it waits for them to load.
+  private async confirmLink(offer: ConnectionOffer): Promise<boolean> {
+    await this.loadRegistry();
+    return this.hostConfirmations.confirmLink(offer, this.hosts);
+  }
+
+  getPendingHostConfirmation(): HostConfirmationRequest | null {
+    return this.hostConfirmations.getPending();
+  }
+
+  subscribeHostConfirmation(listener: () => void): () => void {
+    return this.hostConfirmations.subscribe(listener);
+  }
+
+  answerHostConfirmation(requestId: number, approved: boolean): void {
+    this.hostConfirmations.answer(requestId, approved);
+  }
+
+  /**
+   * Starts one pairing flow, such as one open pairing modal. Once the user
+   * confirms a link, submitting the same link again in this flow (the
+   * password retry) does not ask again. A new flow asks again.
+   */
+  beginLinkPairing(): LinkPairing {
+    let approvedOffer: ConnectionOffer | null = null;
+    return {
+      submit: async (link, password) => {
+        // The host confirmation describes a relay offer (server id, relay, key). A
+        // HyperDHT invite carries only the daemon key, and the server id is known
+        // only after the dial, so the invite pairs without the confirmation.
+        if (isHyperdhtInvite(link)) {
+          const result = await this.upsertHyperdhtConnectionFromInvite(link, password);
+          return { status: "connected", ...result };
+        }
+        const { offer, password: linkPassword } = parseOfferConnectionUrl(link);
+        if (!approvedOffer || !isSameLinkedConnection(approvedOffer, offer)) {
+          if (!(await this.confirmLink(offer))) return { status: "cancelled" };
+          approvedOffer = offer;
+        }
+        const result = await this.probeAndUpsertOffer(offer, password ?? linkPassword);
+        return { status: "connected", ...result };
+      },
+    };
+  }
+
+  async importConnectionLink(
+    url: string,
+    target: PairingNavigationTarget,
+  ): Promise<ConnectionLinkImport> {
+    if (target === "openProject") {
+      const { offer, password } = parseOfferConnectionUrl(url);
+      if (!(await this.confirmLink(offer))) return { status: "cancelled" };
+      const profile = await this.upsertConnectionFromOffer(offer, undefined, password);
+      return { status: "connected", serverId: profile.serverId };
+    }
+    const pairing = this.beginLinkPairing();
+    try {
+      const result = await pairing.submit(url);
+      if (result.status === "cancelled") return result;
+      return { status: "connected", serverId: result.serverId };
+    } catch (error) {
+      if (!getConnectionAuthFailureReason(error)) throw error;
+      return { status: "password_required", link: url, pairing };
+    }
+  }
+
+  private async upsertConnectionFromOffer(
+    offer: ConnectionOffer,
+    label?: string,
+    password?: string,
+  ): Promise<HostProfile> {
+    const connection = relayConnectionFromOffer(offer);
     return this.upsertRelayConnection({
       serverId: offer.serverId,
-      relayEndpoint: offer.relay.endpoint,
-      useTls,
-      daemonPublicKeyB64: offer.daemonPublicKeyB64,
+      relayEndpoint: connection.relayEndpoint,
+      useTls: connection.useTls,
+      daemonPublicKeyB64: connection.daemonPublicKeyB64,
       label,
+      password,
     });
   }
 
-  async upsertConnectionFromOfferUrl(
-    offerUrlOrFragment: string,
-    label?: string,
-  ): Promise<HostProfile> {
-    const marker = "#offer=";
-    const idx = offerUrlOrFragment.indexOf(marker);
-    if (idx === -1) {
-      throw new Error("Missing #offer= fragment");
-    }
-    const encoded = offerUrlOrFragment.slice(idx + marker.length).trim();
-    if (!encoded) {
-      throw new Error("Offer payload is empty");
-    }
-    const payload = decodeOfferFragmentPayload(encoded);
-    const offer = ConnectionOfferSchema.parse(payload);
-    return this.upsertConnectionFromOffer(offer, label);
+  private async probeAndUpsertOffer(
+    offer: ConnectionOffer,
+    password: string | undefined,
+  ): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
+    const connection = relayConnectionFromOffer(offer);
+    const probeHost: HostProfile = {
+      serverId: offer.serverId,
+      ...(password ? { password } : {}),
+      label: offer.serverId,
+      appearance: defaultHostAppearance(),
+      lifecycle: {},
+      connections: [connection],
+      preferredConnectionId: connection.id,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    const { client, hostname } = await this.deps.connectToDaemon({ host: probeHost, connection });
+    await client.close().catch(() => undefined);
+    const profile = await this.upsertConnectionFromOffer(offer, hostname ?? undefined, password);
+    return { profile, serverId: offer.serverId, hostname };
   }
 
   async upsertConnectionFromListen(input: {
@@ -1929,6 +2143,13 @@ export class HostRuntimeStore {
 
   async renameHost(serverId: string, label: string): Promise<void> {
     await this.updateHost(serverId, (host) => ({ ...host, label }));
+  }
+
+  async setHostPassword(serverId: string, password: string): Promise<void> {
+    await this.updateHost(serverId, (host) => {
+      const { password: _previous, ...rest } = host;
+      return password ? { ...rest, password } : rest;
+    });
   }
 
   async setHostColor(serverId: string, color: HostColor): Promise<void> {
@@ -2008,6 +2229,7 @@ export class HostRuntimeStore {
   private async upsertHostConnection(input: {
     serverId: string;
     label?: string;
+    password?: string;
     connection: HostConnection;
     existingClient?: DaemonClient;
   }): Promise<HostProfile> {
@@ -2017,6 +2239,7 @@ export class HostRuntimeStore {
       serverId: input.serverId,
       label: input.label,
       connection: input.connection,
+      password: input.password,
       now,
     });
     this.setHostsAndSync(next, {
@@ -2164,6 +2387,13 @@ export class HostRuntimeStore {
     const sessionStore = useSessionStore.getState();
     sessionStore.initializeSession(serverId, snapshot.client, snapshot.clientGeneration);
     sessionStore.updateSessionClient(serverId, snapshot.client, snapshot.clientGeneration);
+    // A reconnect keeps the same client, so the daemon's handshake (a restart or upgrade can
+    // change its version and features) only reaches the store here. The client clears it while
+    // disconnected; keep the last known value until the next handshake.
+    const serverInfo = snapshot.client.getLastServerInfoMessage();
+    if (serverInfo) {
+      sessionStore.updateSessionServerInfo(serverId, toDaemonServerInfo(serverInfo));
+    }
   }
 
   private clearHostReplica(serverId: string): void {
@@ -2566,21 +2796,22 @@ export function useHostRuntimeConnectionStatuses(
   serverIds: readonly string[],
 ): ReadonlyMap<string, HostRuntimeConnectionStatus> {
   const store = getHostRuntimeStore();
-  const version = useSyncExternalStore(
+  // The snapshot is the statuses themselves, joined into a string so React compares by
+  // value. A version counter read only for reactivity is dropped by the React Compiler.
+  const readStatuses = () =>
+    serverIds
+      .map((serverId) => store.getSnapshot(serverId)?.connectionStatus ?? "connecting")
+      .join("\n");
+  const statuses = useSyncExternalStore(
     (onStoreChange) => store.subscribeAll(onStoreChange),
-    () => store.getVersion(),
-    () => store.getVersion(),
+    readStatuses,
+    readStatuses,
   );
 
   return useMemo(() => {
-    // The aggregate version is the reactivity trigger; re-read snapshots on every host tick.
-    void version;
-    const entries: Array<[string, HostRuntimeConnectionStatus]> = serverIds.map((serverId) => [
-      serverId,
-      store.getSnapshot(serverId)?.connectionStatus ?? "connecting",
-    ]);
-    return new Map(entries);
-  }, [serverIds, store, version]);
+    const values = statuses.split("\n") as HostRuntimeConnectionStatus[];
+    return new Map(serverIds.map((serverId, index) => [serverId, values[index]]));
+  }, [serverIds, statuses]);
 }
 
 export function useHostRuntimeLastError(serverId: string): string | null {
@@ -2639,6 +2870,29 @@ export function useHostRegistryLoaded(): boolean {
   );
 }
 
+export function useHostConfirmation(): {
+  pending: HostConfirmationRequest | null;
+  answer: (approved: boolean) => void;
+} {
+  const store = getHostRuntimeStore();
+  const pending = useSyncExternalStore(
+    (onStoreChange) => store.subscribeHostConfirmation(onStoreChange),
+    () => store.getPendingHostConfirmation(),
+    () => store.getPendingHostConfirmation(),
+  );
+  // The answer is bound to the request this render shows, so a tap never
+  // answers a request that replaced it.
+  return useMemo(
+    () => ({
+      pending,
+      answer: (approved: boolean) => {
+        if (pending) store.answerHostConfirmation(pending.id, approved);
+      },
+    }),
+    [pending, store],
+  );
+}
+
 export interface HostMutations {
   upsertDirectConnection: (input: {
     serverId: string;
@@ -2659,22 +2913,7 @@ export interface HostMutations {
     daemonPort?: number;
     label?: string;
   }) => Promise<{ profile: HostProfile; serverId: string; hostname: string | null }>;
-  upsertRelayConnection: (input: {
-    serverId: string;
-    relayEndpoint: string;
-    useTls?: boolean;
-    daemonPublicKeyB64: string;
-    label?: string;
-  }) => Promise<HostProfile>;
-  upsertConnectionFromOffer: (offer: ConnectionOffer, label?: string) => Promise<HostProfile>;
-  upsertConnectionFromOfferUrl: (
-    offerUrlOrFragment: string,
-    label?: string,
-  ) => Promise<HostProfile>;
-  upsertHyperdhtConnectionFromInvite: (
-    invite: string,
-    label?: string,
-  ) => Promise<{ profile: HostProfile; serverId: string; hostname: string | null }>;
+  beginLinkPairing: () => LinkPairing;
   renameHost: (serverId: string, label: string) => Promise<void>;
   setHostColor: (serverId: string, color: HostColor) => Promise<void>;
   setHostBadgeDisplay: (serverId: string, badgeDisplay: HostBadgeDisplay) => Promise<void>;
@@ -2689,11 +2928,7 @@ export function useHostMutations(): HostMutations {
       upsertDirectConnection: (input) => store.upsertDirectConnection(input),
       probeAndUpsertDirectConnection: (input) => store.probeAndUpsertDirectConnection(input),
       probeAndUpsertRemoteSshConnection: (input) => store.probeAndUpsertRemoteSshConnection(input),
-      upsertRelayConnection: (input) => store.upsertRelayConnection(input),
-      upsertConnectionFromOffer: (offer, label) => store.upsertConnectionFromOffer(offer, label),
-      upsertConnectionFromOfferUrl: (url, label) => store.upsertConnectionFromOfferUrl(url, label),
-      upsertHyperdhtConnectionFromInvite: (invite, label) =>
-        store.upsertHyperdhtConnectionFromInvite(invite, label),
+      beginLinkPairing: () => store.beginLinkPairing(),
       renameHost: (serverId, label) => store.renameHost(serverId, label),
       setHostColor: (serverId, color) => store.setHostColor(serverId, color),
       setHostBadgeDisplay: (serverId, badgeDisplay) =>

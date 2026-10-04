@@ -98,6 +98,14 @@ function replyToCommands(
   });
 }
 
+function capturePendingCommand(child: OmpChild, type: string): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    onOmpCommand(child, (command) => {
+      if (command.type === type) resolve(command);
+    });
+  });
+}
+
 /** Kill the child the moment it receives `type`, so the request is in flight when it dies. */
 function exitOnCommand(child: OmpChild, type: string): void {
   onOmpCommand(child, (command) => {
@@ -113,6 +121,28 @@ function withoutRequestId(command: Record<string, unknown>): Record<string, unkn
 }
 
 describe("OMP CLI runtime", () => {
+  test("steer waits for OMP's response and surfaces rejection", async () => {
+    const child = createOmpChild();
+    let pending: Record<string, unknown> | null = null;
+    onOmpCommand(child, (command) => {
+      if (command.type === "steer") pending = command;
+    });
+    const launches: OmpRuntimeLaunch[] = [];
+    const session = await createRuntime(child, launches).startSession({
+      cwd: "/workspace/project",
+      env: { HOME: "/fixture/omp-home" },
+    });
+    expect(session.environment).toBe(launches[0]?.env);
+    expect(session.environment?.HOME).toBe("/fixture/omp-home");
+    const result = session.steer("change direction");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pending).toMatchObject({ type: "steer", message: "change direction" });
+    child.stdout.write(
+      `${JSON.stringify({ id: pending!.id, type: "response", command: "steer", success: false, error: "rejected" })}\n`,
+    );
+    await expect(result).rejects.toThrow("rejected");
+    await session.close();
+  });
   test("uses the configured RPC timeout and attributes the pending phase", async () => {
     vi.useFakeTimers();
     const child = createOmpChild();
@@ -293,6 +323,27 @@ describe("OMP CLI runtime", () => {
     ]);
   });
 
+  test("compact waits beyond the control-plane timeout for a late response", async () => {
+    vi.useFakeTimers();
+    const child = createOmpChild();
+    const pending = capturePendingCommand(child, "compact");
+    const session = await createRuntime(child, [], { requestTimeoutMs: 100 }).startSession({
+      cwd: "/workspace/project",
+    });
+    try {
+      const compact = session.compact("focus on tests");
+      const command = await pending;
+      await vi.advanceTimersByTimeAsync(101);
+      child.stdout.write(
+        `${JSON.stringify({ id: command.id, type: "response", command: "compact", success: true, data: {} })}\n`,
+      );
+      await expect(compact).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      await session.close();
+    }
+  });
+
   test("accepts the empty prompt acknowledgement emitted by OMP 17", async () => {
     const child = createOmpChild();
     replyToCommands(child, () => undefined);
@@ -440,7 +491,10 @@ describe("OMP CLI runtime", () => {
     const child = createOmpChild();
     const session = await createRuntime(child).startSession({ cwd: "/workspace/project" });
 
+    const environment = session.environment;
     child.emit("exit", 1, null);
+    expect(session.environment).toBe(environment);
+    expect(environment).toBeDefined();
 
     await expect(session.abort()).resolves.toBeUndefined();
   });
