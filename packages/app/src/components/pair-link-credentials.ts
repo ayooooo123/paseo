@@ -1,9 +1,13 @@
 import { parseConnectionOfferFromUrl } from "@getpaseo/protocol/connection-offer";
+import { hyperdhtConnectionFromInvite, isHyperdhtInvite } from "@/types/host-connection";
 import { parseRelayConnectionUri } from "@/utils/daemon-endpoints";
 
 function pairingTarget(url: string): string | null {
   try {
     const trimmed = url.trim();
+    // A peer invite names its host by the full daemon key. Without a target, a
+    // password typed for one host would follow the user to a different peer.
+    if (isHyperdhtInvite(trimmed)) return `dht:${hyperdhtConnectionFromInvite(trimmed).invite}`;
     const offer =
       trimmed.startsWith("relay://") || trimmed.includes("#connect=")
         ? parseRelayConnectionUri(trimmed).offer

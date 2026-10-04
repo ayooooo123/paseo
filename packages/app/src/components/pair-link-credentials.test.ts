@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { encodePeerInvite } from "@getpaseo/protocol/dht-peer";
 import { PairingTargetTracker } from "./pair-link-credentials";
+
+const PEER_A = encodePeerInvite({ publicKey: new Uint8Array(32).fill(1) });
+const PEER_B = encodePeerInvite({ publicKey: new Uint8Array(32).fill(2) });
 
 describe("pairing target password", () => {
   it("clears the password and hides its input when switching hosts", () => {
@@ -34,5 +38,19 @@ describe("pairing target password", () => {
     const target = new PairingTargetTracker("relay://relay.example:443/srv_a?key=AAAA");
     expect(target.changeUrl("https://app.paseo.sh/#offer=")).toBe(false);
     expect(target.changeUrl(`https://app.paseo.sh/#offer=${offer}`)).toBe(true);
+  });
+
+  it("clears the password when switching between a relay host and a HyperDHT peer", () => {
+    const relay = "relay://relay.example:443/srv_a?key=AAAA&ssl=true";
+    const target = new PairingTargetTracker(relay);
+    expect(target.changeUrl(PEER_A)).toBe(true);
+    expect(target.changeUrl(relay)).toBe(true);
+  });
+
+  it("clears the password for a different HyperDHT peer and keeps it for the same one", () => {
+    const target = new PairingTargetTracker(PEER_A);
+    expect(target.changeUrl(` ${PEER_A} `)).toBe(false);
+    expect(target.changeUrl("paseo-peer://v1/")).toBe(false);
+    expect(target.changeUrl(PEER_B)).toBe(true);
   });
 });
